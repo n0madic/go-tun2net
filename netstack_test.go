@@ -113,6 +113,65 @@ func TestEndpointInbound(t *testing.T) {
 	}
 }
 
+// retainingDispatcher keeps the delivered PacketBuffer alive (IncRef) and
+// defers reading its bytes, so a test can mutate the caller's source slice
+// after deliverInbound returns and detect whether the fast path aliased it.
+type retainingDispatcher struct {
+	pkt *stack.PacketBuffer
+}
+
+func (r *retainingDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	pkt.IncRef()
+	r.pkt = pkt
+}
+
+func (r *retainingDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
+
+// TestDeliverInboundCopiesPayload guards the zero-copy assumption in
+// dispatchInbound: buffer.MakeWithData MUST copy the caller's slice, because
+// the direct-delivery fast path passes the session's reusable read buffer
+// straight through and the caller overwrites it the moment deliverInbound
+// returns. If a future gVisor bump ever switches MakeWithData to alias its
+// input, this test fails loudly instead of letting a use-after-free silently
+// corrupt inbound traffic.
+func TestDeliverInboundCopiesPayload(t *testing.T) {
+	t.Parallel()
+
+	cliConn, srvConn := net.Pipe()
+	defer func() { _ = srvConn.Close() }()
+
+	ep := newEndpoint(cliConn, 1500, true /* directDelivery: no readLoop */)
+	disp := &retainingDispatcher{}
+	ep.Attach(disp)
+	defer ep.Close()
+
+	src := []byte{
+		0x45, 0x00, 0x00, 0x14, 0xab, 0xcd, 0x00, 0x00,
+		0x40, 0x01, 0x00, 0x00, 10, 8, 0, 100,
+		10, 8, 0, 1,
+	}
+	want := append([]byte(nil), src...)
+
+	ep.deliverInbound(src)
+
+	// Per the contract the caller may reuse the backing array immediately —
+	// scribble over it, then confirm the delivered packet kept the original.
+	for i := range src {
+		src[i] = 0xff
+	}
+
+	if disp.pkt == nil {
+		t.Fatal("no packet delivered")
+	}
+	v := disp.pkt.ToView()
+	got := append([]byte(nil), v.AsSlice()...)
+	v.Release()
+	disp.pkt.DecRef()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("delivered packet aliased the caller's buffer:\n got: %x\nwant: %x", got, want)
+	}
+}
+
 // TestEndpointOutbound builds a PacketBuffer, hands it to WritePackets, and
 // verifies it appears verbatim on the other side of the pipe.
 func TestEndpointOutbound(t *testing.T) {

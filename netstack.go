@@ -147,6 +147,8 @@ type endpoint struct {
 	// snapshot is Swap'd to 0 each tick so the logged value reflects
 	// "worst single call in this 30s window" — not lifetime worst —
 	// which is the actionable signal for tail-latency investigation.
+	// Only 1-in-deliverSampleN packets are timed (see dispatchInbound), so
+	// this is the worst among the sampled calls, not literally every call.
 	statsMaxDeliverNs atomic.Int64
 }
 
@@ -285,9 +287,24 @@ func (e *endpoint) SetOnCloseAction(f func()) {
 // for a packet-oriented tunnel doesn't signal truncation.
 const maxIPPacketLen = 65535 + 64
 
+// readLoop back-off bounds. A packet-oriented net.Conn that returns a
+// non-terminal error (e.g. a persistent i/o timeout) on every Read must not be
+// allowed to spin the loop at 100% CPU. We sleep readErrBackoff between
+// consecutive failures and abandon the loop after maxConsecutiveReadErrors of
+// them — a conn that errors for ~1s straight is treated as permanently dead.
+const (
+	readErrBackoff           = 10 * time.Millisecond
+	maxConsecutiveReadErrors = 100
+)
+
 func (e *endpoint) readLoop() {
 	defer e.doneCh.Do(func() { close(e.done) })
 	buf := make([]byte, maxIPPacketLen)
+	// consecutiveErrs counts back-to-back non-terminal Read errors; a
+	// successful read resets it. It bounds the back-off below so a conn
+	// wedged in a permanent error state can neither busy-spin nor loop
+	// forever.
+	var consecutiveErrs int
 	for {
 		n, err := e.conn.Read(buf)
 		if err != nil {
@@ -302,10 +319,18 @@ func (e *endpoint) readLoop() {
 				errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// On a transient error the conn is still alive — loop again.
-			// On a permanent error we'll see EOF on the next read.
+			// Non-terminal error: the conn may still be alive (e.g. a
+			// transient i/o timeout). Back off so we don't busy-spin at 100%
+			// CPU, and give up once it's clear the conn will never recover
+			// rather than looping on the same error forever.
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutiveReadErrors {
+				return
+			}
+			time.Sleep(readErrBackoff)
 			continue
 		}
+		consecutiveErrs = 0
 		if n < 1 {
 			continue
 		}
@@ -333,6 +358,11 @@ func (e *endpoint) deliverInbound(ip []byte) {
 	// startup) will resume normal flow without restarting anything.
 	_ = e.dispatchInbound(ip)
 }
+
+// deliverSampleN sets the 1-in-N sampling rate for the dispatcher-latency
+// high-water mark in dispatchInbound. Must be a power of two so the hot path
+// can pick a sample with a bitmask instead of a modulo.
+const deliverSampleN = 16
 
 // dispatchInbound is the shared body used by both readLoop (legacy
 // channel-then-Tunnel.Read path, used by tests and any pre-Net.New
@@ -392,26 +422,36 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 	// The input slice is NOT retained, so it's safe to pass ip directly —
 	// no defensive `append([]byte(nil), ip...)` needed even when the
 	// caller (readLoop or session.handleDataIn) reuses the backing array.
+	// TestDeliverInboundCopiesPayload guards this assumption against a
+	// future gVisor bump that might switch MakeWithData to zero-copy.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(ip),
 	})
-	// Measure the dispatcher call directly: time.Now() is one syscall-
-	// free clock read on darwin/arm64 (~25 ns), so the per-packet cost
-	// of the metric is below the noise floor of a full IP-stack
-	// dispatch. We pair it with a CAS-loop update to statsMaxDeliverNs
-	// so the operator-visible "worst single deliver" surfaces in the
-	// next stats tick without bloating endpoint state.
-	start := time.Now()
+	// Sample the dispatcher latency on 1-in-deliverSampleN packets. time.Now()
+	// is a cheap (~25 ns) syscall-free clock read on darwin/arm64, but on a
+	// multi-Gbps inbound stream even that per-packet cost is worth shedding;
+	// the 30s high-water mark stays just as useful sampled. statsInPackets is
+	// the running inbound total, so masking it yields a fixed 1/deliverSampleN
+	// rate with no extra counter.
+	count := e.statsInPackets.Add(1)
+	measure := count&(deliverSampleN-1) == 0
+	var start time.Time
+	if measure {
+		start = time.Now()
+	}
 	d.DeliverNetworkPacket(proto, pkt)
 	pkt.DecRef()
-	elapsed := time.Since(start).Nanoseconds()
-	for {
-		cur := e.statsMaxDeliverNs.Load()
-		if elapsed <= cur || e.statsMaxDeliverNs.CompareAndSwap(cur, elapsed) {
-			break
+	if measure {
+		// CAS-loop the high-water mark so the operator-visible "worst single
+		// deliver" surfaces in the next stats tick without bloating state.
+		elapsed := time.Since(start).Nanoseconds()
+		for {
+			cur := e.statsMaxDeliverNs.Load()
+			if elapsed <= cur || e.statsMaxDeliverNs.CompareAndSwap(cur, elapsed) {
+				break
+			}
 		}
 	}
-	e.statsInPackets.Add(1)
 	return false
 }
 
@@ -735,6 +775,11 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		if err := n.applyConfig(pr); err != nil && n.log != nil {
 			n.log.Error("netstack applyConfig failed on reconnect", "err", err)
 		}
+		// Unlike New (which defaults a missing MTU to 1500 then clamps), a
+		// reconnect that pushes no MTU (pr.MTU == 0) deliberately keeps the
+		// current NIC MTU instead of resetting to the default: servers
+		// rarely re-push MTU on rekey, and the value negotiated at connect
+		// time is still correct.
 		if pr.MTU > 0 {
 			n.ep.SetMTU(clampInnerMTU(uint32(pr.MTU)))
 		}
@@ -991,14 +1036,24 @@ func (n *Net) Close() error {
 	if n.detachOnReconnect != nil {
 		n.detachOnReconnect()
 	}
-	close(n.statsStop)
+	// statsStop/stack/ep are nil on a Net assembled by hand (test helpers
+	// build one directly rather than via New); guard each so Close stays
+	// safe on a partially-constructed Net instead of panicking on a nil
+	// channel close or a nil-receiver method call.
+	if n.statsStop != nil {
+		close(n.statsStop)
+	}
 	// Wait for statsLoggerLoop to finish its in-flight snap() before
 	// tearing down the gVisor stack — without this, n.stack.Close()
 	// can race a still-running n.stack.Stats() call inside the loop
-	// and trip gVisor internals.
+	// and trip gVisor internals. Safe on a zero WaitGroup.
 	n.statsWG.Wait()
-	n.stack.Close()
-	n.ep.Close()
+	if n.stack != nil {
+		n.stack.Close()
+	}
+	if n.ep != nil {
+		n.ep.Close()
+	}
 	return nil
 }
 
@@ -1006,6 +1061,74 @@ func (n *Net) Close() error {
 // to the session's stats period so the two logs interleave on the same
 // cadence and operators can correlate them.
 const statsLogPeriod = 30 * time.Second
+
+// netStats is one snapshot of the LinkEndpoint counters plus the gVisor stack
+// counters statsLoggerLoop tracks. Grouping them in a struct (rather than a
+// 22-value return) keeps the delta bookkeeping readable and turns a field
+// reordering into a compile error instead of a silently swapped metric.
+type netStats struct {
+	outPkts, outErr, inPkts, inTCP, inUDP, inICMP  uint64
+	tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd uint64
+	tcpFailedOpens, tcpCurEst                      uint64
+	udpSent, udpSendErr, udpRcvd, udpUnknownPort   uint64
+	ipSent, ipRcvd, ipMalformed                    uint64
+	dropped                                        uint64
+}
+
+// snapStats reads the current LinkEndpoint and gVisor stack counters.
+func (n *Net) snapStats() netStats {
+	st := n.stack.Stats()
+	return netStats{
+		outPkts:        n.ep.statsOutPackets.Load(),
+		outErr:         n.ep.statsOutErrors.Load(),
+		inPkts:         n.ep.statsInPackets.Load(),
+		inTCP:          n.ep.statsInTCP.Load(),
+		inUDP:          n.ep.statsInUDP.Load(),
+		inICMP:         n.ep.statsInICMP.Load(),
+		tcpSent:        st.TCP.SegmentsSent.Value(),
+		tcpSendErr:     st.TCP.SegmentSendErrors.Value(),
+		tcpRetrans:     st.TCP.Retransmits.Value(),
+		tcpResetsRcvd:  st.TCP.ResetsReceived.Value(),
+		tcpFailedOpens: st.TCP.FailedConnectionAttempts.Value(),
+		tcpCurEst:      st.TCP.CurrentEstablished.Value(),
+		udpSent:        st.UDP.PacketsSent.Value(),
+		udpSendErr:     st.UDP.PacketSendErrors.Value(),
+		udpRcvd:        st.UDP.PacketsReceived.Value(),
+		udpUnknownPort: st.UDP.UnknownPortErrors.Value(),
+		ipSent:         st.IP.PacketsSent.Value(),
+		ipRcvd:         st.IP.PacketsReceived.Value(),
+		ipMalformed:    st.IP.MalformedPacketsReceived.Value(),
+		dropped:        st.DroppedPackets.Value(),
+	}
+}
+
+// sub returns the per-field delta s - p. These are monotonic counters that
+// never wrap in practice, so a plain subtraction is correct. tcpCurEst is a
+// gauge (currently-established conns), so its "delta" is meaningless — callers
+// log cur.tcpCurEst directly instead of d.tcpCurEst.
+func (s netStats) sub(p netStats) netStats {
+	return netStats{
+		outPkts:        s.outPkts - p.outPkts,
+		outErr:         s.outErr - p.outErr,
+		inPkts:         s.inPkts - p.inPkts,
+		inTCP:          s.inTCP - p.inTCP,
+		inUDP:          s.inUDP - p.inUDP,
+		inICMP:         s.inICMP - p.inICMP,
+		tcpSent:        s.tcpSent - p.tcpSent,
+		tcpSendErr:     s.tcpSendErr - p.tcpSendErr,
+		tcpRetrans:     s.tcpRetrans - p.tcpRetrans,
+		tcpResetsRcvd:  s.tcpResetsRcvd - p.tcpResetsRcvd,
+		tcpFailedOpens: s.tcpFailedOpens - p.tcpFailedOpens,
+		udpSent:        s.udpSent - p.udpSent,
+		udpSendErr:     s.udpSendErr - p.udpSendErr,
+		udpRcvd:        s.udpRcvd - p.udpRcvd,
+		udpUnknownPort: s.udpUnknownPort - p.udpUnknownPort,
+		ipSent:         s.ipSent - p.ipSent,
+		ipRcvd:         s.ipRcvd - p.ipRcvd,
+		ipMalformed:    s.ipMalformed - p.ipMalformed,
+		dropped:        s.dropped - p.dropped,
+	}
+}
 
 // statsLoggerLoop periodically logs a structured snapshot of the
 // LinkEndpoint counters and key gVisor stack.Stats() fields. Designed
@@ -1030,50 +1153,7 @@ func (n *Net) statsLoggerLoop() {
 	t := time.NewTicker(statsLogPeriod)
 	defer t.Stop()
 
-	var (
-		prevOutPkts, prevOutErr, prevInPkts uint64
-		prevInTCP, prevInUDP, prevInICMP    uint64
-		prevTCPSent, prevTCPSendErr         uint64
-		prevTCPRetrans, prevTCPResetsRcvd   uint64
-		prevTCPFailedOpens                  uint64
-		prevUDPSent, prevUDPSendErr         uint64
-		prevUDPRcvd, prevUDPUnknownPort     uint64
-		prevIPSent, prevIPRcvd              uint64
-		prevIPMalformed                     uint64
-		prevDropped                         uint64
-	)
-
-	snap := func() (
-		outPkts, outErr, inPkts, inTCP, inUDP, inICMP uint64,
-		tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd, tcpFailedOpens, tcpCurEst uint64,
-		udpSent, udpSendErr, udpRcvd, udpUnknownPort uint64,
-		ipSent, ipRcvd, ipMalformed uint64,
-		dropped uint64,
-	) {
-		outPkts = n.ep.statsOutPackets.Load()
-		outErr = n.ep.statsOutErrors.Load()
-		inPkts = n.ep.statsInPackets.Load()
-		inTCP = n.ep.statsInTCP.Load()
-		inUDP = n.ep.statsInUDP.Load()
-		inICMP = n.ep.statsInICMP.Load()
-		st := n.stack.Stats()
-		tcpSent = st.TCP.SegmentsSent.Value()
-		tcpSendErr = st.TCP.SegmentSendErrors.Value()
-		tcpRetrans = st.TCP.Retransmits.Value()
-		tcpResetsRcvd = st.TCP.ResetsReceived.Value()
-		tcpFailedOpens = st.TCP.FailedConnectionAttempts.Value()
-		tcpCurEst = st.TCP.CurrentEstablished.Value()
-		udpSent = st.UDP.PacketsSent.Value()
-		udpSendErr = st.UDP.PacketSendErrors.Value()
-		udpRcvd = st.UDP.PacketsReceived.Value()
-		udpUnknownPort = st.UDP.UnknownPortErrors.Value()
-		ipSent = st.IP.PacketsSent.Value()
-		ipRcvd = st.IP.PacketsReceived.Value()
-		ipMalformed = st.IP.MalformedPacketsReceived.Value()
-		dropped = st.DroppedPackets.Value()
-		return
-	}
-
+	var prev netStats
 	for {
 		select {
 		case <-n.statsStop:
@@ -1081,11 +1161,9 @@ func (n *Net) statsLoggerLoop() {
 		case <-t.C:
 		}
 
-		outPkts, outErr, inPkts, inTCP, inUDP, inICMP,
-			tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd, tcpFailedOpens, tcpCurEst,
-			udpSent, udpSendErr, udpRcvd, udpUnknownPort,
-			ipSent, ipRcvd, ipMalformed,
-			dropped := snap()
+		cur := n.snapStats()
+		d := cur.sub(prev)
+		prev = cur
 
 		// Swap-and-reset: the next 30s window starts from 0 so the
 		// reported number always means "worst single call IN THIS
@@ -1093,46 +1171,6 @@ func (n *Net) statsLoggerLoop() {
 		// regressions. Lifetime-max would freeze on the first big
 		// spike and never recover.
 		maxDeliverUs := n.ep.statsMaxDeliverNs.Swap(0) / 1000
-
-		dOutPkts := outPkts - prevOutPkts
-		dOutErr := outErr - prevOutErr
-		dInPkts := inPkts - prevInPkts
-		dInTCP := inTCP - prevInTCP
-		dInUDP := inUDP - prevInUDP
-		dInICMP := inICMP - prevInICMP
-		dTCPSent := tcpSent - prevTCPSent
-		dTCPSendErr := tcpSendErr - prevTCPSendErr
-		dTCPRetrans := tcpRetrans - prevTCPRetrans
-		dTCPResetsRcvd := tcpResetsRcvd - prevTCPResetsRcvd
-		dTCPFailedOpens := tcpFailedOpens - prevTCPFailedOpens
-		dUDPSent := udpSent - prevUDPSent
-		dUDPSendErr := udpSendErr - prevUDPSendErr
-		dUDPRcvd := udpRcvd - prevUDPRcvd
-		dUDPUnknownPort := udpUnknownPort - prevUDPUnknownPort
-		dIPSent := ipSent - prevIPSent
-		dIPRcvd := ipRcvd - prevIPRcvd
-		dIPMalformed := ipMalformed - prevIPMalformed
-		dDropped := dropped - prevDropped
-
-		prevOutPkts = outPkts
-		prevOutErr = outErr
-		prevInPkts = inPkts
-		prevInTCP = inTCP
-		prevInUDP = inUDP
-		prevInICMP = inICMP
-		prevTCPSent = tcpSent
-		prevTCPSendErr = tcpSendErr
-		prevTCPRetrans = tcpRetrans
-		prevTCPResetsRcvd = tcpResetsRcvd
-		prevTCPFailedOpens = tcpFailedOpens
-		prevUDPSent = udpSent
-		prevUDPSendErr = udpSendErr
-		prevUDPRcvd = udpRcvd
-		prevUDPUnknownPort = udpUnknownPort
-		prevIPSent = ipSent
-		prevIPRcvd = ipRcvd
-		prevIPMalformed = ipMalformed
-		prevDropped = dropped
 
 		// Anything that looks like a real symptom escalates to WARN so
 		// it surfaces without -v: outright errors, an elevated
@@ -1148,8 +1186,8 @@ func (n *Net) statsLoggerLoop() {
 		// tunnel. Same reasoning that retired the RST-storm watchdog
 		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
-		if dOutErr > 0 || dTCPSendErr > 0 || dUDPSendErr > 0 ||
-			dIPMalformed > 0 || dDropped > 0 || dUDPUnknownPort > 0 {
+		if d.outErr > 0 || d.tcpSendErr > 0 || d.udpSendErr > 0 ||
+			d.ipMalformed > 0 || d.dropped > 0 || d.udpUnknownPort > 0 {
 			level = slog.LevelWarn
 		}
 		// TCP retransmits are a symptom only as a *fraction* of segments sent:
@@ -1160,7 +1198,7 @@ func (n *Net) statsLoggerLoop() {
 		// Escalate only when retransmits exceed ~2% of what we sent this window,
 		// with a small floor so a tiny window where one or two retransmits
 		// dominate the ratio can't false-positive.
-		if dTCPRetrans > 10 && dTCPRetrans*100 > dTCPSent*2 {
+		if d.tcpRetrans > 10 && d.tcpRetrans*100 > d.tcpSent*2 {
 			level = slog.LevelWarn
 		}
 		// A single gVisor dispatcher call eating >5 ms is the canonical
@@ -1177,40 +1215,41 @@ func (n *Net) statsLoggerLoop() {
 			n.log.Log(context.Background(), level, "netstack stats",
 				"interval", statsLogPeriod,
 				// LinkEndpoint counters (deltas + totals).
-				"delta_ep_out", dOutPkts,
-				"delta_ep_out_err", dOutErr,
-				"delta_ep_in", dInPkts,
-				"delta_ep_in_tcp", dInTCP,
-				"delta_ep_in_udp", dInUDP,
-				"delta_ep_in_icmp", dInICMP,
-				"ep_out_total", outPkts,
-				"ep_out_err_total", outErr,
-				"ep_in_total", inPkts,
-				"ep_in_udp_total", inUDP,
+				"delta_ep_out", d.outPkts,
+				"delta_ep_out_err", d.outErr,
+				"delta_ep_in", d.inPkts,
+				"delta_ep_in_tcp", d.inTCP,
+				"delta_ep_in_udp", d.inUDP,
+				"delta_ep_in_icmp", d.inICMP,
+				"ep_out_total", cur.outPkts,
+				"ep_out_err_total", cur.outErr,
+				"ep_in_total", cur.inPkts,
+				"ep_in_udp_total", cur.inUDP,
 				// gVisor TCP.
-				"delta_tcp_sent", dTCPSent,
-				"delta_tcp_send_err", dTCPSendErr,
-				"delta_tcp_retrans", dTCPRetrans,
-				"delta_tcp_resets_rcvd", dTCPResetsRcvd,
-				"delta_tcp_failed_opens", dTCPFailedOpens,
-				"tcp_current_established", tcpCurEst,
+				"delta_tcp_sent", d.tcpSent,
+				"delta_tcp_send_err", d.tcpSendErr,
+				"delta_tcp_retrans", d.tcpRetrans,
+				"delta_tcp_resets_rcvd", d.tcpResetsRcvd,
+				"delta_tcp_failed_opens", d.tcpFailedOpens,
+				"tcp_current_established", cur.tcpCurEst,
 				// gVisor UDP.
-				"delta_udp_sent", dUDPSent,
-				"delta_udp_send_err", dUDPSendErr,
-				"delta_udp_rcvd", dUDPRcvd,
-				"delta_udp_unknown_port", dUDPUnknownPort,
+				"delta_udp_sent", d.udpSent,
+				"delta_udp_send_err", d.udpSendErr,
+				"delta_udp_rcvd", d.udpRcvd,
+				"delta_udp_unknown_port", d.udpUnknownPort,
 				// gVisor IP.
-				"delta_ip_sent", dIPSent,
-				"delta_ip_rcvd", dIPRcvd,
-				"delta_ip_malformed", dIPMalformed,
+				"delta_ip_sent", d.ipSent,
+				"delta_ip_rcvd", d.ipRcvd,
+				"delta_ip_malformed", d.ipMalformed,
 				// Catch-all.
-				"delta_dropped", dDropped,
+				"delta_dropped", d.dropped,
 				// Tail-latency probe for the direct-delivery fast path:
 				// worst single DeliverNetworkPacket call (microseconds)
-				// observed in this window. Read loop blocks for exactly
-				// this long on the worst packet — useful to spot gVisor
-				// under-contention slow paths before they manifest as
-				// OS-UDP-buffer overflow.
+				// among the 1-in-deliverSampleN packets sampled this window
+				// (see dispatchInbound). The read loop blocks for exactly
+				// this long on the worst sampled packet — useful to spot
+				// gVisor slow paths before they manifest as OS-UDP-buffer
+				// overflow.
 				"max_deliver_us", maxDeliverUs,
 			)
 		}
