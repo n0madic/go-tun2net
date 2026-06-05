@@ -184,7 +184,20 @@ func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
 	e.linkAddr = addr
 }
 
-func (*endpoint) Capabilities() stack.LinkEndpointCapabilities { return stack.CapabilityNone }
+// Capabilities advertises RX checksum offload so gVisor does NOT re-verify the
+// L4 (TCP/UDP) checksum of inbound packets. Inner packets arrive from a remote
+// network where checksum offload routinely leaves forwarded/locally-generated
+// segments with an incomplete checksum (normally finalized by the egress NIC);
+// when such a packet is captured/encrypted before any NIC touches it (e.g. a
+// VPN server forwarding internet traffic into ESP), its inner checksum is
+// "wrong" yet the packet is perfectly valid. The tunnel's own integrity
+// guarantee (ESP ICV / OpenVPN HMAC) already authenticates the bytes, so
+// re-checking the inner checksum is both redundant and harmful — it silently
+// drops legitimate traffic. TX offload is deliberately NOT set: outbound
+// packets must carry a real checksum the remote stack will verify.
+func (*endpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityRXChecksumOffload
+}
 
 // Attach wires the dispatcher and (unless directDelivery is set) starts
 // the reader goroutine that pumps inbound IP packets up the stack.
