@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 // Package tun2net adapts a PacketTunnel — anything that carries raw IP
 // datagrams (one Read/Write == one IP packet) — to a gVisor userspace TCP/IP
