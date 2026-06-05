@@ -48,14 +48,16 @@ import (
 const nicID tcpip.NICID = 1
 
 // ErrTunnelIPChanged is returned from Net.DialContext when an
-// AutoReconnect-driven session swap installed a new tunnel-local IP
-// between the snapshot taken at entry and the snapshot taken after the
-// gonet dial. The conn is force-closed before this error is returned
-// (so callers don't leak a zombie endpoint bound to a stale source IP).
-// Use errors.Is to distinguish this from a generic dial failure — it's
-// safe to retry the same dial immediately, the second attempt binds to
-// the fresh local IP.
-var ErrTunnelIPChanged = errors.New("netstack: tunnel IP changed during dial")
+// AutoReconnect-driven session swap happened while the gonet dial was in
+// flight. It is detected via the reconnect generation counter bumped by the
+// OnReconfigure hook, so it also covers a same-IP reconnect — the server can
+// hand back the identical tunnel-local IP for a brand-new session, and
+// comparing the generation rather than just the IP is what catches that case.
+// The conn is force-closed before this error is returned (so callers don't
+// leak a zombie endpoint bound to the pre-reconnect session). Use errors.Is to
+// distinguish this from a generic dial failure — it's safe to retry the same
+// dial immediately, the second attempt binds to the fresh state.
+var ErrTunnelIPChanged = errors.New("netstack: tunnel reconnected during dial")
 
 // safeInnerMTU caps the gVisor NIC's MTU so that, after OpenVPN
 // encryption + UDP/IP outer headers, the resulting wire datagram
@@ -138,6 +140,13 @@ type endpoint struct {
 	statsInICMP  atomic.Uint64
 	statsInOther atomic.Uint64
 
+	// statsInPanics counts inbound packets whose DeliverNetworkPacket call
+	// panicked and was recovered in endpoint.deliver. A non-zero delta means
+	// gVisor's dispatch hit a bug on some inbound packet; the recover keeps a
+	// single malformed packet from killing the whole inbound data path, and
+	// the stats logger escalates to WARN so the condition stays visible.
+	statsInPanics atomic.Uint64
+
 	// statsMaxDeliverNs is the high-water mark of how long a single
 	// d.DeliverNetworkPacket call took (nanoseconds) since the last
 	// statsLoggerLoop snapshot. In direct-delivery mode that call runs
@@ -197,6 +206,12 @@ func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
 // re-checking the inner checksum is both redundant and harmful — it silently
 // drops legitimate traffic. TX offload is deliberately NOT set: outbound
 // packets must carry a real checksum the remote stack will verify.
+//
+// Note the breadth of this flag in the pinned gVisor: RXChecksumOffload makes
+// the IPv4 layer skip verifying the IP *header* checksum too (ipv4.go:1839),
+// not just the L4 (TCP/UDP) checksum — both are treated as already validated
+// by the tunnel's integrity guarantee. That is the behaviour we want here, but
+// it is wider than the name suggests.
 func (*endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return stack.CapabilityRXChecksumOffload
 }
@@ -307,6 +322,17 @@ func (e *endpoint) readLoop() {
 	var consecutiveErrs int
 	for {
 		n, err := e.conn.Read(buf)
+		// Deliver any bytes returned BEFORE inspecting err: a packet-oriented
+		// Conn may hand back (n>0, io.EOF) from a single Read, and inspecting
+		// the error first would drop that final inbound packet.
+		if n > 0 {
+			if e.dispatchInbound(buf[:n]) {
+				// dispatcher missing — Attach hasn't wired one or the NIC
+				// was removed. Without a sink there's nothing to do, so
+				// terminate the loop cleanly.
+				return
+			}
+		}
 		if err != nil {
 			// Any error on a closed endpoint terminates the loop.
 			e.closeMu.Lock()
@@ -331,15 +357,6 @@ func (e *endpoint) readLoop() {
 			continue
 		}
 		consecutiveErrs = 0
-		if n < 1 {
-			continue
-		}
-		if e.dispatchInbound(buf[:n]) {
-			// dispatcher missing — Attach hasn't wired one or the NIC
-			// was removed. Without a sink there's nothing to do, so
-			// terminate the loop cleanly.
-			return
-		}
 	}
 }
 
@@ -439,8 +456,7 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 	if measure {
 		start = time.Now()
 	}
-	d.DeliverNetworkPacket(proto, pkt)
-	pkt.DecRef()
+	e.deliver(d, proto, pkt)
 	if measure {
 		// CAS-loop the high-water mark so the operator-visible "worst single
 		// deliver" surfaces in the next stats tick without bloating state.
@@ -453,6 +469,26 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 		}
 	}
 	return false
+}
+
+// deliver hands one inbound PacketBuffer to the dispatcher with two
+// guarantees: the buffer's ref is always released (the deferred DecRef runs
+// even on a panic), and a panic inside gVisor's dispatch — e.g. a malformed
+// inbound packet tripping a bug deep in the IP/transport demux — is recovered
+// so it kills only this one packet, not the entire inbound data path (in
+// direct-delivery mode that path is the session read loop, so an unrecovered
+// panic would tear down the whole tunnel). Recovered panics are counted in
+// statsInPanics and surface as a WARN in the next stats tick. The single
+// deferred closure costs a few nanoseconds per packet — a worthwhile premium
+// for not letting one bad packet take down the data plane.
+func (e *endpoint) deliver(d stack.NetworkDispatcher, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	defer func() {
+		pkt.DecRef()
+		if r := recover(); r != nil {
+			e.statsInPanics.Add(1)
+		}
+	}()
+	d.DeliverNetworkPacket(proto, pkt)
 }
 
 // WritePackets serialises each PacketBuffer to a single IP datagram and
@@ -536,12 +572,22 @@ type Net struct {
 	log   *slog.Logger
 
 	// nicMu protects the fields below — they're rewritten on every
-	// reconnect when applyConfig runs.
-	nicMu   sync.Mutex
-	localV4 netip.Addr
-	localV6 netip.Addr
-	hasV4   bool
-	hasV6   bool
+	// reconnect when applyConfig runs. A family is "present" iff its
+	// localV4/localV6 is valid; prefixV4/prefixV6 track the installed prefix
+	// length so applyConfig can detect a mask-only change (same address, new
+	// netmask) that an address comparison alone would miss.
+	nicMu    sync.Mutex
+	localV4  netip.Addr
+	localV6  netip.Addr
+	prefixV4 int
+	prefixV6 int
+
+	// reconnectGen counts AutoReconnect-driven session swaps. The
+	// OnReconfigure hook bumps it (before applyConfig / closeActiveOnReconnect
+	// run); DialContext samples it before dialing and finalizeDial re-checks it
+	// after, so a reconnect racing an in-flight dial — even one that hands back
+	// the SAME tunnel IP — is detected and the conn force-closed.
+	reconnectGen atomic.Uint64
 
 	closeMu sync.Mutex
 	closed  bool
@@ -695,7 +741,11 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	}
 	mtu := clampInnerMTU(uint32(rawMTU))
 
-	ep := newEndpoint(t.TunnelConn(), mtu, true /* directDelivery */)
+	conn := t.TunnelConn()
+	if conn == nil {
+		return nil, errors.New("tun2net: packet tunnel returned nil TunnelConn")
+	}
+	ep := newEndpoint(conn, mtu, true /* directDelivery */)
 
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
@@ -757,6 +807,13 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		if n.closed {
 			return
 		}
+		// Bump the reconnect generation BEFORE applyConfig and
+		// closeActiveOnReconnect run. A DialContext whose trackConn races
+		// closeActiveOnReconnect's Range is then guaranteed to observe the
+		// bump in finalizeDial and force-close its just-registered conn — that
+		// is what catches a same-IP reconnect, which an old-vs-new IP
+		// comparison silently missed.
+		n.reconnectGen.Add(1)
 		// Snapshot the pre-reconnect local addresses purely for log
 		// context — we used to skip closing conns when the tunnel IP
 		// stayed the same, but empirically that policy left zombie
@@ -814,11 +871,13 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	return n, nil
 }
 
-// applyConfig (re)installs the NIC's IPv4/IPv6 protocol addresses and
-// route table from the supplied PushReply. Designed to be idempotent and
-// safe to call from a reconnect hook: it adds the new address first, then
-// removes the prior one (if different), so there's no window where the NIC
-// has no address.
+// applyConfig (re)installs the NIC's IPv4/IPv6 protocol addresses and route
+// table from the supplied PushReply. Designed to be idempotent and safe to
+// call from a reconnect hook: each family is reconciled by syncFamily, which
+// adds the new address before removing the old one when only the address
+// changed (no window without an address) and remove-then-adds on a mask-only
+// change. Treats invalid / wrong-family PushReply fields as "drop the family"
+// so a dual-stack → single-stack switch doesn't leave a stale address behind.
 //
 // Existing TCP/UDP gVisor connections that were bound to the OLD address
 // continue to exist but their outbound packets carry the old source IP and
@@ -829,62 +888,41 @@ func (n *Net) applyConfig(pr TunConfig) error {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
 
-	oldV4, oldHasV4 := n.localV4, n.hasV4
-	oldV6, oldHasV6 := n.localV6, n.hasV6
+	// Desired v4 state: a valid Is4 LocalIP plus its netmask-derived prefix,
+	// else "no v4".
+	var wantV4 netip.Addr
+	wantV4Prefix := 0
+	if pr.LocalIP.IsValid() && pr.LocalIP.Is4() {
+		wantV4 = pr.LocalIP
+		wantV4Prefix = maskPrefixLen(pr.Netmask)
+	}
+	// Desired v6 state from "ifconfig-ipv6 <local>/<plen> <peer>": LocalIP6
+	// carries the address + prefix, RemoteIP6 the default next-hop (handled in
+	// buildRoutes), mirroring how "route-gateway" supplies the IPv4 default.
+	var wantV6 netip.Addr
+	wantV6Prefix := 0
+	if pr.LocalIP6.IsValid() && pr.LocalIP6.Addr().Is6() {
+		wantV6 = pr.LocalIP6.Addr()
+		wantV6Prefix = pr.LocalIP6.Bits()
+		if wantV6Prefix < 0 || wantV6Prefix > 128 {
+			wantV6Prefix = 128
+		}
+	}
 
-	// Compute the desired post-apply state. Treat invalid / wrong-family
-	// PushReply fields as "drop the family entirely" — otherwise a server
-	// that switched from dual-stack to v6-only (or vice versa) would leave
-	// the NIC carrying a stale address that HasIPv4/HasIPv6 still advertise,
-	// causing gVisor to bind sockets to an IP the server no longer routes.
-	var newV4 netip.Addr
-	newHasV4 := pr.LocalIP.IsValid() && pr.LocalIP.Is4()
-	if newHasV4 {
-		newV4 = pr.LocalIP
+	// Reconcile each family. Record the resulting state into the fields even on
+	// error: they must mirror gVisor's actual NIC state so the next reconnect
+	// neither re-adds an address gVisor already holds (ErrDuplicateAddress) nor
+	// skips removing one it still does.
+	var firstErr error
+	v4, v4Prefix, err := n.syncFamily(ipv4.ProtocolNumber, n.localV4, n.prefixV4, wantV4, wantV4Prefix)
+	n.localV4, n.prefixV4 = v4, v4Prefix
+	if err != nil {
+		firstErr = fmt.Errorf("v4: %w", err)
 	}
-	var newV6 netip.Addr
-	newHasV6 := pr.LocalIP6.IsValid() && pr.LocalIP6.Addr().Is6()
-	if newHasV6 {
-		newV6 = pr.LocalIP6.Addr()
-	}
-
-	if newHasV4 && (!oldHasV4 || oldV4 != newV4) {
-		ip := newV4.As4()
-		addrProto := tcpip.ProtocolAddress{
-			Protocol: ipv4.ProtocolNumber,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.AddrFrom4(ip),
-				PrefixLen: maskPrefixLen(pr.Netmask),
-			},
-		}
-		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
-			return fmt.Errorf("AddProtocolAddress v4: %s", err)
-		}
-		n.localV4 = newV4
-		n.hasV4 = true
-	}
-	// IPv6 NIC address comes from "ifconfig-ipv6 <local>/<plen> <peer>" and
-	// is parsed into pr.LocalIP6 (a Prefix). The peer address is RemoteIP6
-	// and serves as the default v6 gateway, mirroring how "route-gateway"
-	// supplies the IPv4 default.
-	if newHasV6 && (!oldHasV6 || oldV6 != newV6) {
-		ip := newV6.As16()
-		prefixLen := pr.LocalIP6.Bits()
-		if prefixLen < 0 || prefixLen > 128 {
-			prefixLen = 128
-		}
-		addrProto := tcpip.ProtocolAddress{
-			Protocol: ipv6.ProtocolNumber,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.AddrFrom16(ip),
-				PrefixLen: prefixLen,
-			},
-		}
-		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
-			return fmt.Errorf("AddProtocolAddress v6: %s", err)
-		}
-		n.localV6 = newV6
-		n.hasV6 = true
+	v6, v6Prefix, err := n.syncFamily(ipv6.ProtocolNumber, n.localV6, n.prefixV6, wantV6, wantV6Prefix)
+	n.localV6, n.prefixV6 = v6, v6Prefix
+	if err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("v6: %w", err)
 	}
 
 	// Reinstall the route table verbatim — SetRouteTable replaces (not
@@ -892,27 +930,74 @@ func (n *Net) applyConfig(pr TunConfig) error {
 	// automatically.
 	n.stack.SetRouteTable(buildRoutes(pr))
 
-	// Drop stale addresses last so there's no instant where the NIC has no
-	// IPv4/IPv6 configured. Two cases: (a) family kept, address changed
-	// (oldV4 != newV4); (b) family disappeared from the new PushReply
-	// (!newHasV4 while oldHasV4) — without this branch the NIC silently
-	// retains the old address and HasIPv4 keeps reporting true.
-	if oldHasV4 && (!newHasV4 || oldV4 != newV4) {
-		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom4(oldV4.As4()))
-		if !newHasV4 {
-			n.localV4 = netip.Addr{}
-			n.hasV4 = false
+	return firstErr
+}
+
+// syncFamily reconciles one address family on the NIC, returning the
+// (address, prefix) now installed so applyConfig can record it. `have`/
+// `havePrefix` is what's currently installed (have invalid == none), `want`/
+// `wantPrefix` what the new config asks for (want invalid == drop the family).
+//
+// The reconcile order avoids a window where the NIC has no address of this
+// family: on an address change the new address is added before the old one is
+// removed. gVisor keys an address by its Address bytes alone, so a mask-only
+// change (same Address, new PrefixLen) can't be layered on top — that returns
+// ErrDuplicateAddress — so it is remove-then-add. The returned state always
+// reflects what gVisor actually holds afterwards, including on an
+// AddProtocolAddress failure, so a later reconnect can't desync.
+func (n *Net) syncFamily(proto tcpip.NetworkProtocolNumber, have netip.Addr, havePrefix int, want netip.Addr, wantPrefix int) (netip.Addr, int, error) {
+	// Family no longer wanted — drop any stale address.
+	if !want.IsValid() {
+		if have.IsValid() {
+			n.removeAddr(have)
 		}
+		return netip.Addr{}, 0, nil
 	}
-	if oldHasV6 && (!newHasV6 || oldV6 != newV6) {
-		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom16(oldV6.As16()))
-		if !newHasV6 {
-			n.localV6 = netip.Addr{}
-			n.hasV6 = false
-		}
+	// Already in the desired state — nothing to do.
+	if have.IsValid() && have == want && havePrefix == wantPrefix {
+		return have, havePrefix, nil
 	}
 
-	return nil
+	// A mask-only change reuses the same Address, which AddProtocolAddress
+	// would reject as a duplicate — remove the old one first.
+	prefixOnly := have.IsValid() && have == want
+	if prefixOnly {
+		n.removeAddr(have)
+	}
+
+	addrProto := tcpip.ProtocolAddress{
+		Protocol: proto,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFromSlice(want.AsSlice()),
+			PrefixLen: wantPrefix,
+		},
+	}
+	if addErr := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); addErr != nil {
+		err := fmt.Errorf("AddProtocolAddress: %s", addErr)
+		if prefixOnly {
+			// The old address was already removed; gVisor now holds none.
+			return netip.Addr{}, 0, err
+		}
+		// The old address (if any) is still installed and untouched.
+		return have, havePrefix, err
+	}
+
+	// Address change: now that the new address is installed it's safe to drop
+	// the old one. (For prefixOnly we already removed it; for a fresh family
+	// there was none.)
+	if have.IsValid() && !prefixOnly {
+		n.removeAddr(have)
+	}
+	return want, wantPrefix, nil
+}
+
+// removeAddr removes addr from the NIC, logging (but not failing on) a
+// RemoveAddress error: a stale address that lingers is a diagnosable
+// condition worth a WARN, not a fatal one for the reconnect path.
+func (n *Net) removeAddr(addr netip.Addr) {
+	if err := n.stack.RemoveAddress(nicID, tcpip.AddrFromSlice(addr.AsSlice())); err != nil && n.log != nil {
+		n.log.Warn("netstack: RemoveAddress failed", "addr", addr, "err", err.String())
+	}
 }
 
 // buildRoutes converts a PushReply's gateway+routes into a gVisor route
@@ -941,33 +1026,42 @@ func buildRoutes(pr TunConfig) []tcpip.Route {
 			NIC:         nicID,
 		})
 	}
-	for _, p := range pr.Routes {
-		if !p.Addr().IsValid() {
-			continue
+	addPrefixRoutes := func(prefixes []netip.Prefix) {
+		for _, p := range prefixes {
+			if !p.Addr().IsValid() {
+				continue
+			}
+			sub, err := tcpipSubnetFromPrefix(p)
+			if err != nil {
+				continue
+			}
+			routes = append(routes, tcpip.Route{Destination: sub, NIC: nicID})
 		}
-		net, err := tcpipSubnetFromPrefix(p)
-		if err != nil {
-			continue
-		}
-		routes = append(routes, tcpip.Route{Destination: net, NIC: nicID})
 	}
-	for _, p := range pr.Routes6 {
-		if !p.Addr().IsValid() {
-			continue
-		}
-		net, err := tcpipSubnetFromPrefix(p)
-		if err != nil {
-			continue
-		}
-		routes = append(routes, tcpip.Route{Destination: net, NIC: nicID})
-	}
+	addPrefixRoutes(pr.Routes)
+	addPrefixRoutes(pr.Routes6)
+
 	if len(routes) == 0 {
-		// On-link route over the NIC so the stack knows traffic should head
-		// out via the endpoint even with no gateway pushed.
-		routes = append(routes, tcpip.Route{
-			Destination: header.IPv4EmptySubnet,
-			NIC:         nicID,
-		})
+		// No gateway and no explicit routes were pushed. Install an on-link
+		// default for EACH family that actually has a local address so the
+		// stack knows that family's traffic should head out via the endpoint.
+		// A v6-only assignment must get an IPv6 default — the old unconditional
+		// IPv4-only fallback left such a NIC with no route for its own family.
+		if pr.LocalIP6.IsValid() && pr.LocalIP6.Addr().Is6() {
+			routes = append(routes, tcpip.Route{
+				Destination: header.IPv6EmptySubnet,
+				NIC:         nicID,
+			})
+		}
+		// Add the v4 on-link default when there's a v4 address, or when nothing
+		// else was added at all (preserving the prior behaviour in the fully
+		// degenerate empty-config case).
+		if (pr.LocalIP.IsValid() && pr.LocalIP.Is4()) || len(routes) == 0 {
+			routes = append(routes, tcpip.Route{
+				Destination: header.IPv4EmptySubnet,
+				NIC:         nicID,
+			})
+		}
 	}
 	return routes
 }
@@ -997,7 +1091,7 @@ func (n *Net) LocalIP6() netip.Addr {
 func (n *Net) HasIPv4() bool {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
-	return n.hasV4
+	return n.localV4.IsValid()
 }
 
 // HasIPv6 reports whether the NIC has an IPv6 address from the latest
@@ -1007,7 +1101,7 @@ func (n *Net) HasIPv4() bool {
 func (n *Net) HasIPv6() bool {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
-	return n.hasV6
+	return n.localV6.IsValid()
 }
 
 // Close tears down the netstack but leaves the underlying tunnel
@@ -1068,6 +1162,7 @@ const statsLogPeriod = 30 * time.Second
 // reordering into a compile error instead of a silently swapped metric.
 type netStats struct {
 	outPkts, outErr, inPkts, inTCP, inUDP, inICMP  uint64
+	inPanics                                       uint64
 	tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd uint64
 	tcpFailedOpens, tcpCurEst                      uint64
 	udpSent, udpSendErr, udpRcvd, udpUnknownPort   uint64
@@ -1085,6 +1180,7 @@ func (n *Net) snapStats() netStats {
 		inTCP:          n.ep.statsInTCP.Load(),
 		inUDP:          n.ep.statsInUDP.Load(),
 		inICMP:         n.ep.statsInICMP.Load(),
+		inPanics:       n.ep.statsInPanics.Load(),
 		tcpSent:        st.TCP.SegmentsSent.Value(),
 		tcpSendErr:     st.TCP.SegmentSendErrors.Value(),
 		tcpRetrans:     st.TCP.Retransmits.Value(),
@@ -1114,6 +1210,7 @@ func (s netStats) sub(p netStats) netStats {
 		inTCP:          s.inTCP - p.inTCP,
 		inUDP:          s.inUDP - p.inUDP,
 		inICMP:         s.inICMP - p.inICMP,
+		inPanics:       s.inPanics - p.inPanics,
 		tcpSent:        s.tcpSent - p.tcpSent,
 		tcpSendErr:     s.tcpSendErr - p.tcpSendErr,
 		tcpRetrans:     s.tcpRetrans - p.tcpRetrans,
@@ -1187,7 +1284,8 @@ func (n *Net) statsLoggerLoop() {
 		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
 		if d.outErr > 0 || d.tcpSendErr > 0 || d.udpSendErr > 0 ||
-			d.ipMalformed > 0 || d.dropped > 0 || d.udpUnknownPort > 0 {
+			d.ipMalformed > 0 || d.dropped > 0 || d.udpUnknownPort > 0 ||
+			d.inPanics > 0 {
 			level = slog.LevelWarn
 		}
 		// TCP retransmits are a symptom only as a *fraction* of segments sent:
@@ -1198,7 +1296,7 @@ func (n *Net) statsLoggerLoop() {
 		// Escalate only when retransmits exceed ~2% of what we sent this window,
 		// with a small floor so a tiny window where one or two retransmits
 		// dominate the ratio can't false-positive.
-		if d.tcpRetrans > 10 && d.tcpRetrans*100 > d.tcpSent*2 {
+		if d.tcpRetrans > 10 && d.tcpSent > 0 && d.tcpRetrans*100 > d.tcpSent*2 {
 			level = slog.LevelWarn
 		}
 		// A single gVisor dispatcher call eating >5 ms is the canonical
@@ -1221,6 +1319,7 @@ func (n *Net) statsLoggerLoop() {
 				"delta_ep_in_tcp", d.inTCP,
 				"delta_ep_in_udp", d.inUDP,
 				"delta_ep_in_icmp", d.inICMP,
+				"delta_ep_in_panics", d.inPanics,
 				"ep_out_total", cur.outPkts,
 				"ep_out_err_total", cur.outErr,
 				"ep_in_total", cur.inPkts,
@@ -1285,6 +1384,11 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		// with a literal IP.
 		return nil, fmt.Errorf("netstack: DialContext requires literal IP, got %q", host)
 	}
+	// Normalise an IPv4-mapped IPv6 literal (e.g. "::ffff:10.0.0.1") to its
+	// native v4 form. Without this it is treated as a v6 destination and
+	// routed/bound on the v6 NIC address — which a v4-only tunnel doesn't
+	// have — instead of the v4 path the operator actually meant.
+	ip = ip.Unmap()
 
 	var (
 		proto tcpip.NetworkProtocolNumber
@@ -1301,15 +1405,16 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, fmt.Errorf("netstack: unsupported address %q", host)
 	}
 
-	// Snapshot the local IPs BEFORE the (potentially blocking) gonet dial
-	// so we can detect a tunnel-IP change that occurred during the dial.
-	// Without this guard, an OnReconnect hook running between
-	// gonet.Dial and trackConn would close every *currently-tracked*
-	// conn but miss the about-to-be-tracked one — its register call
-	// arrives after closeActiveOnReconnect has finished and the conn
-	// stays bound to the now-stale source IP, becoming a zombie that
-	// gVisor TCP only abandons after 60-120s of retransmits.
-	preV4, preV6 := n.snapshotLocalIPs()
+	// Snapshot the reconnect generation BEFORE the (potentially blocking)
+	// gonet dial so finalizeDial can detect a reconnect that occurred during
+	// the dial. Without this guard, an OnReconnect hook running between
+	// gonet.Dial and trackConn would close every *currently-tracked* conn but
+	// miss the about-to-be-tracked one — its register call arrives after
+	// closeActiveOnReconnect has finished and the conn stays bound to the
+	// now-stale source IP, becoming a zombie that gVisor TCP only abandons
+	// after 60-120s of retransmits. The generation counter (unlike an IP
+	// comparison) also fires on a same-IP reconnect.
+	preGen := n.reconnectGen.Load()
 
 	var dialed net.Conn
 	switch network {
@@ -1337,30 +1442,30 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("netstack: unsupported network")}
 	}
 
-	// Register BEFORE the final snapshot check so a reconnect hook that
-	// fires inside the [trackConn, snapshot post] window force-closes
-	// this conn via closeActiveOnReconnect — without this, the conn
-	// would be invisible to the hook and stay bound to a stale source
-	// IP until gVisor TCP's 60-120s retransmit timeout.
-	tracked := n.trackConn(dialed)
-	postV4, postV6 := n.snapshotLocalIPs()
-	if preV4 != postV4 || preV6 != postV6 {
-		_ = tracked.Close()
-		return nil, &net.OpError{
-			Op: "dial", Net: network,
-			Err: ErrTunnelIPChanged,
-		}
-	}
-	return tracked, nil
+	return n.finalizeDial(dialed, preGen, network)
 }
 
-// snapshotLocalIPs returns a copy of the NIC's current IPv4 and IPv6
-// addresses under nicMu, so the caller can detect concurrent reconnect-
-// driven address changes.
-func (n *Net) snapshotLocalIPs() (netip.Addr, netip.Addr) {
-	n.nicMu.Lock()
-	defer n.nicMu.Unlock()
-	return n.localV4, n.localV6
+// finalizeDial registers a freshly-dialed conn in the reconnect tracker and
+// guards against a reconnect that raced the dial. preGen is the reconnect
+// generation sampled before the (possibly blocking) dial; if it no longer
+// matches, an OnReconfigure hook fired while we were dialing — the conn is
+// bound to a now-stale tunnel session, so it is force-closed and
+// ErrTunnelIPChanged returned (safe to retry; the next attempt binds to the
+// fresh state).
+//
+// Tracking happens BEFORE the generation re-check so a hook firing in the
+// [trackConn, recheck] window force-closes this conn via
+// closeActiveOnReconnect; the generation re-check covers the complementary
+// window where the hook's Range already ran before trackConn registered us.
+// Because the hook bumps the generation BEFORE its closeActiveOnReconnect
+// Range, at least one of the two mechanisms always catches the conn.
+func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.Conn, error) {
+	tracked := n.trackConn(dialed)
+	if n.reconnectGen.Load() != preGen {
+		_ = tracked.Close()
+		return nil, &net.OpError{Op: "dial", Net: network, Err: ErrTunnelIPChanged}
+	}
+	return tracked, nil
 }
 
 // currentLocalFullAddress returns a FullAddress suitable as `laddr` for a
@@ -1372,13 +1477,13 @@ func (n *Net) currentLocalFullAddress(v4 bool) *tcpip.FullAddress {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
 	if v4 {
-		if !n.hasV4 {
+		if !n.localV4.IsValid() {
 			return nil
 		}
 		a := n.localV4.As4()
 		return &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(a)}
 	}
-	if !n.hasV6 {
+	if !n.localV6.IsValid() {
 		return nil
 	}
 	a := n.localV6.As16()
@@ -1387,50 +1492,34 @@ func (n *Net) currentLocalFullAddress(v4 bool) *tcpip.FullAddress {
 
 // maskPrefixLen converts a 4-byte IPv4 netmask address into a prefix length
 // by counting LEADING ones (a contiguous mask is required by RFC 4632).
-// Rejects non-contiguous masks by returning /32.
+// Rejects non-contiguous masks by returning /32 — net.IPMask.Size reports
+// (0, 0) for a non-canonical mask, which we map to /32.
 func maskPrefixLen(a netip.Addr) int {
 	if !a.IsValid() || !a.Is4() {
 		return 32
 	}
 	b := a.As4()
-	prefix := 0
-	seenZero := false
-	for _, x := range b {
-		for bit := 7; bit >= 0; bit-- {
-			if x&(1<<bit) != 0 {
-				if seenZero {
-					return 32
-				}
-				prefix++
-			} else {
-				seenZero = true
-			}
-		}
+	ones, bits := net.IPMask(b[:]).Size()
+	if bits == 0 {
+		return 32
 	}
-	return prefix
+	return ones
 }
 
-// tcpipSubnetFromPrefix converts a netip.Prefix into a tcpip.Subnet.
+// tcpipSubnetFromPrefix converts a netip.Prefix into a tcpip.Subnet. It masks
+// off any host bits via Prefix.Masked so the resulting subnet is canonical,
+// and lets AddressWithPrefix.Subnet build the gVisor value (AddrFromSlice
+// picks the 4- or 16-byte address form from the slice length). An error is
+// returned only for an unsupported address family.
 func tcpipSubnetFromPrefix(p netip.Prefix) (tcpip.Subnet, error) {
-	addr := p.Addr()
-	bits := p.Bits()
-	switch {
-	case addr.Is4():
-		full := addr.As4()
-		mask := net.CIDRMask(bits, 32)
-		var masked [4]byte
-		for i := range masked {
-			masked[i] = full[i] & mask[i]
-		}
-		return tcpip.NewSubnet(tcpip.AddrFrom4(masked), tcpip.MaskFromBytes(mask))
-	case addr.Is6():
-		full := addr.As16()
-		mask := net.CIDRMask(bits, 128)
-		var masked [16]byte
-		for i := range masked {
-			masked[i] = full[i] & mask[i]
-		}
-		return tcpip.NewSubnet(tcpip.AddrFrom16(masked), tcpip.MaskFromBytes(mask))
+	masked := p.Masked()
+	addr := masked.Addr()
+	if !addr.Is4() && !addr.Is6() {
+		return tcpip.Subnet{}, fmt.Errorf("netstack: unsupported address family in prefix %s", p)
 	}
-	return tcpip.Subnet{}, fmt.Errorf("netstack: unsupported address family in prefix %s", p)
+	awp := tcpip.AddressWithPrefix{
+		Address:   tcpip.AddrFromSlice(addr.AsSlice()),
+		PrefixLen: masked.Bits(),
+	}
+	return awp.Subnet(), nil
 }

@@ -276,3 +276,82 @@ func TestApplyPushReplyIdempotent(t *testing.T) {
 		t.Fatalf("10.0.0.5 registered %d times after idempotent calls, want 1", count)
 	}
 }
+
+// TestApplyConfigPrefixChange is the F2 regression: a reconnect that keeps the
+// same IP but changes only the netmask (/24 → /16) must reinstall the address
+// with the new prefix length instead of leaving the stale /24 on the NIC.
+func TestApplyConfigPrefixChange(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr1 := TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.5"),
+		Netmask: netip.MustParseAddr("255.255.255.0"), // /24
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := n.applyConfig(pr1); err != nil {
+		t.Fatalf("applyConfig(pr1): %v", err)
+	}
+	// Same IP, wider mask.
+	pr2 := TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.5"),
+		Netmask: netip.MustParseAddr("255.255.0.0"), // /16
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := n.applyConfig(pr2); err != nil {
+		t.Fatalf("applyConfig(pr2): %v", err)
+	}
+
+	addrs := n.stack.NICInfo()[nicID].ProtocolAddresses
+	var v4 *tcpip.AddressWithPrefix
+	count := 0
+	for i, a := range addrs {
+		if a.AddressWithPrefix.Address.String() == "10.0.0.5" {
+			v4 = &addrs[i].AddressWithPrefix
+			count++
+		}
+	}
+	if v4 == nil {
+		t.Fatalf("10.0.0.5 not on NIC; got addrs=%v", addrs)
+	}
+	if count != 1 {
+		t.Fatalf("10.0.0.5 registered %d times, want 1 (stale prefix not cleaned up)", count)
+	}
+	if v4.PrefixLen != 16 {
+		t.Fatalf("v4 PrefixLen = %d, want 16 — mask /24→/16 not applied on same-IP reconnect", v4.PrefixLen)
+	}
+}
+
+// TestDialContextUnmapsV4MappedV6 is the F7 regression: an IPv4-mapped IPv6
+// literal ("::ffff:10.0.0.1") must be dialed as native v4 and bound to the v4
+// NIC source — on a v4-only NIC the un-unmapped v6 path has no address.
+func TestDialContextUnmapsV4MappedV6(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr := TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.5"),
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := n.applyConfig(pr); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	// UDP because gonet.DialUDP is non-blocking — a successful bind is all we
+	// need to observe.
+	c, err := n.DialContext(ctx, "udp", "[::ffff:10.0.0.1]:53")
+	if err != nil {
+		t.Fatalf("DialContext v4-mapped: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	addr := c.LocalAddr().String()
+	if !strings.HasPrefix(addr, "10.0.0.5:") {
+		t.Fatalf("LocalAddr = %q, want 10.0.0.5:... — v4-mapped literal not unmapped to v4", addr)
+	}
+}

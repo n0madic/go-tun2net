@@ -90,6 +90,30 @@ func TestNewWiresTunnel(t *testing.T) {
 	}
 }
 
+// TestReconnectGenBumpsOnHook verifies the OnReconfigure hook bumps the
+// reconnect generation even when the server hands back the SAME tunnel IP —
+// that bump is what lets finalizeDial catch a same-IP reconnect that an
+// old-vs-new IP comparison would silently miss (F1).
+func TestReconnectGenBumpsOnHook(t *testing.T) {
+	m := newMock(t, "10.0.0.2")
+	n, err := New(m, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = n.Close() }()
+
+	before := n.reconnectGen.Load()
+	m.reconf(TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.2"), // identical IP — gen must still bump
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+		MTU:     1400,
+	})
+	if after := n.reconnectGen.Load(); after != before+1 {
+		t.Fatalf("reconnectGen = %d, want %d (hook must bump even on same-IP reconnect)", after, before+1)
+	}
+}
+
 // TestCloseAllClosesTunnel verifies CloseAll closes a PacketTunnel that
 // implements io.Closer.
 func TestCloseAllClosesTunnel(t *testing.T) {

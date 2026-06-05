@@ -4,6 +4,8 @@ package tun2net
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -438,5 +440,137 @@ func TestSubnetFromPrefix(t *testing.T) {
 	}
 	if subnet.Prefix() != 24 {
 		t.Fatalf("prefix=%d, want 24", subnet.Prefix())
+	}
+}
+
+// TestBuildRoutesIPv6Only is a regression for the fallback that used to
+// install only an IPv4 on-link default: a v6-only assignment (no Gateway, no
+// RemoteIP6, no explicit routes) must still get an IPv6 default route, else
+// gVisor has no route for its own family and every v6 dial fails.
+func TestBuildRoutesIPv6Only(t *testing.T) {
+	t.Parallel()
+	pr := TunConfig{
+		LocalIP6: netip.MustParsePrefix("2001:db8::7/64"),
+		// Deliberately no Gateway / RemoteIP6 / Routes — exercise the
+		// no-gateway fallback path.
+	}
+	routes := buildRoutes(pr)
+	var sawV6Default bool
+	for _, r := range routes {
+		if r.Destination.Equal(header.IPv6EmptySubnet) {
+			sawV6Default = true
+		}
+	}
+	if !sawV6Default {
+		t.Fatalf("v6-only config produced no IPv6 on-link default; got routes=%v", routes)
+	}
+}
+
+// TestFinalizeDialReconnectGuard exercises the reconnect-generation guard in
+// isolation (no gVisor, no races): when the generation moved between the
+// pre-dial snapshot and finalizeDial, the conn is force-closed and
+// ErrTunnelIPChanged is returned; when it didn't, the tracked conn comes back
+// untouched and registered.
+func TestFinalizeDialReconnectGuard(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reconnect during dial", func(t *testing.T) {
+		t.Parallel()
+		n := &Net{}
+		preGen := n.reconnectGen.Load()
+		n.reconnectGen.Add(1) // simulate an OnReconfigure hook firing mid-dial
+		conn := &fakeCloseCounter{}
+
+		got, err := n.finalizeDial(conn, preGen, "tcp")
+		if !errors.Is(err, ErrTunnelIPChanged) {
+			t.Fatalf("err = %v, want ErrTunnelIPChanged", err)
+		}
+		if got != nil {
+			t.Fatalf("conn = %v, want nil on guard trip", got)
+		}
+		if conn.closes != 1 {
+			t.Fatalf("underlying conn closed %d times, want 1 (force-close on guard)", conn.closes)
+		}
+		count := 0
+		n.activeConns.Range(func(_, _ any) bool { count++; return true })
+		if count != 0 {
+			t.Fatalf("activeConns has %d entries after guard trip, want 0", count)
+		}
+	})
+
+	t.Run("no reconnect", func(t *testing.T) {
+		t.Parallel()
+		n := &Net{}
+		preGen := n.reconnectGen.Load()
+		conn := &fakeCloseCounter{}
+
+		got, err := n.finalizeDial(conn, preGen, "tcp")
+		if err != nil {
+			t.Fatalf("finalizeDial: %v", err)
+		}
+		if _, ok := got.(*trackedConn); !ok {
+			t.Fatalf("got %T, want *trackedConn", got)
+		}
+		if conn.closes != 0 {
+			t.Fatalf("conn closed %d times, want 0", conn.closes)
+		}
+		count := 0
+		n.activeConns.Range(func(_, _ any) bool { count++; return true })
+		if count != 1 {
+			t.Fatalf("activeConns has %d entries, want 1 (tracked)", count)
+		}
+	})
+}
+
+// eofConn is a net.Conn whose single Read returns a full packet together with
+// io.EOF — the (n>0, err!=nil) shape a packet-oriented conn may produce — and
+// io.EOF with no data thereafter. Used to prove readLoop delivers the final
+// packet before honouring the terminal error.
+type eofConn struct {
+	fakeCloseCounter
+	mu   sync.Mutex
+	data []byte
+	done bool
+}
+
+func (c *eofConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done {
+		return 0, io.EOF
+	}
+	c.done = true
+	return copy(p, c.data), io.EOF
+}
+
+// TestReadLoopDeliversFinalPacketWithEOF is the F5 regression: a Read that
+// returns (n>0, io.EOF) in one call must still have its payload delivered
+// before the loop honours the EOF and exits.
+func TestReadLoopDeliversFinalPacketWithEOF(t *testing.T) {
+	t.Parallel()
+
+	ipv4Pkt := []byte{
+		0x45, 0x00, 0x00, 0x14, 0xab, 0xcd, 0x00, 0x00,
+		0x40, 0x01, 0x00, 0x00, 10, 8, 0, 100,
+		10, 8, 0, 1,
+	}
+	conn := &eofConn{data: append([]byte(nil), ipv4Pkt...)}
+	ep := newEndpoint(conn, 1500, false /* directDelivery=false → readLoop runs */)
+	disp := newFakeDispatcher()
+	ep.Attach(disp)
+	defer ep.Close()
+
+	got := disp.waitPacket(t, 2*time.Second)
+	if !bytes.Equal(got.body, ipv4Pkt) {
+		t.Fatalf("final packet not delivered before EOF:\n got: %x\nwant: %x", got.body, ipv4Pkt)
+	}
+
+	// readLoop must then exit cleanly on the EOF.
+	done := make(chan struct{})
+	go func() { ep.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not exit after EOF")
 	}
 }
