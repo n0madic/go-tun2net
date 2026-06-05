@@ -1135,9 +1135,9 @@ func (n *Net) statsLoggerLoop() {
 		prevDropped = dropped
 
 		// Anything that looks like a real symptom escalates to WARN so
-		// it surfaces without -v: outright errors, sustained
-		// retransmits, malformed packets, generic dropped packets, or
-		// UDP responses landing on closed endpoints.
+		// it surfaces without -v: outright errors, an elevated
+		// retransmit rate, malformed packets, generic dropped packets,
+		// or UDP responses landing on closed endpoints.
 		//
 		// `delta_tcp_resets_rcvd` is intentionally NOT included even
 		// though it's surfaced in the message body for diagnosis. A
@@ -1149,8 +1149,18 @@ func (n *Net) statsLoggerLoop() {
 		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
 		if dOutErr > 0 || dTCPSendErr > 0 || dUDPSendErr > 0 ||
-			dTCPRetrans > 5 ||
 			dIPMalformed > 0 || dDropped > 0 || dUDPUnknownPort > 0 {
+			level = slog.LevelWarn
+		}
+		// TCP retransmits are a symptom only as a *fraction* of segments sent:
+		// an absolute count scales with throughput, so the few tenths of a
+		// percent of loss that is normal over the real internet trips an
+		// absolute threshold on a perfectly healthy high-volume tunnel (the
+		// same noise problem that excludes delta_tcp_resets_rcvd above).
+		// Escalate only when retransmits exceed ~2% of what we sent this window,
+		// with a small floor so a tiny window where one or two retransmits
+		// dominate the ratio can't false-positive.
+		if dTCPRetrans > 10 && dTCPRetrans*100 > dTCPSent*2 {
 			level = slog.LevelWarn
 		}
 		// A single gVisor dispatcher call eating >5 ms is the canonical
