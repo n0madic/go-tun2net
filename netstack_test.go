@@ -285,6 +285,52 @@ func (f *fakeCloseCounter) SetDeadline(time.Time) error      { return nil }
 func (f *fakeCloseCounter) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakeCloseCounter) SetWriteDeadline(time.Time) error { return nil }
 
+// fakePacketConn is a net.Conn that also implements net.PacketConn, mimicking
+// gVisor's *UDPConn.
+type fakePacketConn struct {
+	fakeCloseCounter
+	reads, writes int
+}
+
+func (f *fakePacketConn) ReadFrom([]byte) (int, net.Addr, error) { f.reads++; return 0, nil, nil }
+func (f *fakePacketConn) WriteTo([]byte, net.Addr) (int, error)  { f.writes++; return 0, nil }
+
+// TestTrackedPacketConn checks that a UDP-style conn (implementing
+// net.PacketConn) is handed back as a net.PacketConn — Go's resolver relies on
+// this to pick datagram framing — while a plain net.Conn is not, and that both
+// remain tracked for reconnect close.
+func TestTrackedPacketConn(t *testing.T) {
+	t.Parallel()
+	n := &Net{}
+
+	pc := &fakePacketConn{}
+	conn := n.trackConn(pc)
+	got, ok := conn.(net.PacketConn)
+	if !ok {
+		t.Fatal("UDP-style conn must be exposed as net.PacketConn")
+	}
+	// ReadFrom/WriteTo forward to the underlying packet conn.
+	_, _, _ = got.ReadFrom(nil)
+	_, _ = got.WriteTo(nil, nil)
+	if pc.reads != 1 || pc.writes != 1 {
+		t.Fatalf("ReadFrom/WriteTo not forwarded: reads=%d writes=%d", pc.reads, pc.writes)
+	}
+
+	// A plain stream conn must NOT masquerade as a packet conn.
+	plain := n.trackConn(&fakeCloseCounter{})
+	if _, ok := plain.(net.PacketConn); ok {
+		t.Fatal("stream conn must not be exposed as net.PacketConn")
+	}
+
+	// Both are tracked and force-closed on reconnect.
+	if closed := n.closeActiveOnReconnect(); closed != 2 {
+		t.Fatalf("closeActiveOnReconnect = %d, want 2", closed)
+	}
+	if pc.closes != 1 {
+		t.Fatalf("packet conn closed %d times, want 1", pc.closes)
+	}
+}
+
 // TestClampInnerMTU verifies the conservative NIC MTU policy: gVisor's
 // NIC MTU must never exceed safeInnerMTU, regardless of what the
 // server pushes. This is the architectural equivalent of the

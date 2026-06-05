@@ -586,15 +586,35 @@ func (t *trackedConn) CloseRead() error {
 	return nil
 }
 
+// trackedPacketConn extends trackedConn with the net.PacketConn surface
+// (ReadFrom/WriteTo) so a gonet UDP conn handed back by DialContext is still
+// recognised as a packet conn. This matters because Go's net.Resolver uses
+// datagram framing (no 2-byte length prefix) only when the dialed conn
+// satisfies net.PacketConn; without it, UDP DNS queries get a spurious TCP
+// length prefix and are rejected. The embedded *trackedConn is what's
+// registered in activeConns, so reconnect tracking is unchanged.
+type trackedPacketConn struct {
+	*trackedConn
+	pc net.PacketConn
+}
+
+func (t *trackedPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return t.pc.ReadFrom(p) }
+func (t *trackedPacketConn) WriteTo(p []byte, a net.Addr) (int, error) { return t.pc.WriteTo(p, a) }
+
 // trackConn wraps a fresh conn from gonet into a trackedConn and
 // registers it in activeConns. The returned conn is always safe to
-// Close even if called multiple times.
+// Close even if called multiple times. UDP conns (which implement
+// net.PacketConn) are returned as a *trackedPacketConn so the packet-conn
+// surface is preserved.
 func (n *Net) trackConn(c net.Conn) net.Conn {
 	if c == nil {
 		return nil
 	}
 	tc := &trackedConn{Conn: c, n: n}
 	n.activeConns.Store(tc, struct{}{})
+	if pc, ok := c.(net.PacketConn); ok {
+		return &trackedPacketConn{trackedConn: tc, pc: pc}
+	}
 	return tc
 }
 
