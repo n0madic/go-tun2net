@@ -130,7 +130,7 @@ func (r *retainingDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber
 func (r *retainingDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
 
 // TestDeliverInboundCopiesPayload guards the zero-copy assumption in
-// dispatchInbound: buffer.MakeWithData MUST copy the caller's slice, because
+// inject: buffer.MakeWithData MUST copy the caller's slice, because
 // the direct-delivery fast path passes the session's reusable read buffer
 // straight through and the caller overwrites it the moment deliverInbound
 // returns. If a future gVisor bump ever switches MakeWithData to alias its
@@ -572,5 +572,146 @@ func TestReadLoopDeliversFinalPacketWithEOF(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("readLoop did not exit after EOF")
+	}
+}
+
+// TestWritePacketsSkipsReservedPrepend exercises the AsViewList path on a
+// realistic packet shape: reserved header space plus a pushed network header
+// across multiple views. WritePackets must emit exactly the on-wire bytes
+// (header + payload) and drop the unused reserved prepend (off > 0), without
+// which it would send garbage prepend bytes or corrupt the datagram.
+func TestWritePacketsSkipsReservedPrepend(t *testing.T) {
+	t.Parallel()
+	cli, srv := net.Pipe()
+	defer func() { _ = cli.Close() }()
+	defer func() { _ = srv.Close() }()
+
+	ep := newEndpoint(cli, 1500, false)
+	defer ep.Close()
+	ep.Attach(newFakeDispatcher())
+
+	payload := []byte("payload-bytes")
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: 40,
+		Payload:            buffer.MakeWithData(payload),
+	})
+	hdr := pkt.NetworkHeader().Push(4)
+	copy(hdr, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	defer pkt.DecRef()
+
+	var pbl stack.PacketBufferList
+	pbl.PushBack(pkt)
+
+	wroteCh := make(chan int, 1)
+	go func() {
+		n, err := ep.WritePackets(pbl)
+		if err != nil {
+			t.Errorf("WritePackets: %v", err)
+		}
+		wroteCh <- n
+	}()
+
+	want := append([]byte{0xDE, 0xAD, 0xBE, 0xEF}, payload...)
+	buf := make([]byte, 128)
+	n, err := srv.Read(buf)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	if got := buf[:n]; !bytes.Equal(got, want) {
+		t.Fatalf("on-wire = %x, want %x (reserved prepend not skipped / views mishandled)", got, want)
+	}
+	if n := <-wroteCh; n != 1 {
+		t.Fatalf("WritePackets returned n=%d, want 1", n)
+	}
+}
+
+// TestStackDestroyDoesNotDeadlock guards the directDelivery Wait() fix: a
+// caller using the public Stack() accessor to Destroy()/Wait() the stack must
+// not hang. removeNIC detaches us via Attach(nil) and then blocks on
+// LinkEndpoint.Wait(); without closing e.done from Attach(nil) that blocks
+// forever in directDelivery mode (no readLoop closes it).
+func TestStackDestroyDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+	cli, srv := net.Pipe()
+	defer func() { _ = srv.Close() }()
+
+	ep := newEndpoint(cli, 1500, true /* directDelivery: no readLoop */)
+	s := stack.New(stack.Options{})
+	if err := s.CreateNIC(nicID, ep); err != nil {
+		t.Fatalf("CreateNIC: %s", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.Destroy() // Close + Wait; Wait → LinkEndpoint.Wait() → <-e.done
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stack.Destroy() deadlocked on endpoint.Wait()")
+	}
+}
+
+// TestNetStatsSub guards the array-based delta loop: every metric index must be
+// subtracted, with no field silently skipped (the bug class the struct→array
+// refactor exists to prevent).
+func TestNetStatsSub(t *testing.T) {
+	t.Parallel()
+	var cur, prev netStats
+	for i := range cur {
+		cur[i] = uint64(i*100 + 1000)
+		prev[i] = uint64(i * 3)
+	}
+	d := cur.sub(prev)
+	for i := range d {
+		if want := cur[i] - prev[i]; d[i] != want {
+			t.Errorf("sub[%d] = %d, want %d", i, d[i], want)
+		}
+	}
+}
+
+// TestStatsMetricDefsComplete catches a metric index that was added to the
+// enum/snapStats but forgotten in metricDefs (it would otherwise never be
+// logged), and confirms the one gauge stays a gauge.
+func TestStatsMetricDefsComplete(t *testing.T) {
+	t.Parallel()
+	for i := range numMetrics {
+		m := metricDefs[i]
+		if m.deltaKey == "" && m.totalKey == "" && m.gaugeKey == "" {
+			t.Errorf("metric index %d has no log key — forgotten metricDefs entry", i)
+		}
+	}
+	if metricDefs[mTCPCurEst].gaugeKey == "" {
+		t.Error("mTCPCurEst must be logged as a gauge (current value, no delta)")
+	}
+}
+
+// TestSnapStatsEndpointCounters verifies snapStats maps each LinkEndpoint
+// counter to the correct metric index.
+func TestSnapStatsEndpointCounters(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	n.ep.statsOutPackets.Store(11)
+	n.ep.statsOutErrors.Store(22)
+	n.ep.statsInPackets.Store(33)
+	n.ep.statsInTCP.Store(44)
+	n.ep.statsInUDP.Store(55)
+	n.ep.statsInICMP.Store(66)
+	n.ep.statsInPanics.Store(77)
+
+	s := n.snapStats()
+	for _, c := range []struct {
+		idx  int
+		want uint64
+	}{
+		{mOutPkts, 11}, {mOutErr, 22}, {mInPkts, 33}, {mInTCP, 44},
+		{mInUDP, 55}, {mInICMP, 66}, {mInPanics, 77},
+	} {
+		if s[c.idx] != c.want {
+			t.Errorf("snapStats[%d] = %d, want %d", c.idx, s[c.idx], c.want)
+		}
 	}
 }

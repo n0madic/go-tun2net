@@ -84,14 +84,36 @@ var ErrTunnelIPChanged = errors.New("netstack: tunnel reconnected during dial")
 // then degrades under sustained TCP load".
 const safeInnerMTU = 1400
 
-// clampInnerMTU returns the smaller of `pushed` and safeInnerMTU,
-// floored sensibly. Used both at New time and on every reconnect
-// so a server pushing a different MTU still gets clamped.
+// defaultMTU is the inner MTU assumed when a tunnel pushes no MTU at connect
+// time, before clamping to safeInnerMTU.
+const defaultMTU = 1500
+
+// clampInnerMTU caps `pushed` at safeInnerMTU — it is a ceiling, not a floor:
+// a zero or over-large value becomes safeInnerMTU, any smaller value is kept
+// as-is. Used both at New time and on every reconnect so a server pushing a
+// different MTU still gets clamped.
 func clampInnerMTU(pushed uint32) uint32 {
 	if pushed == 0 || pushed > safeInnerMTU {
 		return safeInnerMTU
 	}
 	return pushed
+}
+
+// resolveMTU derives the inner NIC MTU from a server-pushed value and the MTU
+// currently installed on the NIC, encoding the whole policy in one place. A
+// pushed value is always clamped to safeInnerMTU. pushed==0 means "no MTU was
+// pushed": at connect time (current==0) it defaults to defaultMTU before
+// clamping, while on a reconnect/rekey (current>0) the current MTU is kept —
+// servers rarely re-push MTU on rekey and the value negotiated at connect time
+// is still correct.
+func resolveMTU(pushed, current uint32) uint32 {
+	if pushed == 0 {
+		if current == 0 {
+			return clampInnerMTU(defaultMTU)
+		}
+		return current
+	}
+	return clampInnerMTU(pushed)
 }
 
 // endpoint is a stack.LinkEndpoint backed by a tunnel net.Conn that carries
@@ -111,8 +133,11 @@ type endpoint struct {
 	// one defensive memcpy per inbound packet.
 	directDelivery bool
 
+	// mu guards linkAddr. dispatcher is read on every inbound packet
+	// (endpoint.inject) and written only by Attach, so it lives in an
+	// atomic.Pointer to keep that hot path lock-free.
 	mu         sync.RWMutex
-	dispatcher stack.NetworkDispatcher
+	dispatcher atomic.Pointer[stack.NetworkDispatcher]
 	linkAddr   tcpip.LinkAddress
 
 	onClose func()
@@ -126,7 +151,6 @@ type endpoint struct {
 	statsOutPackets atomic.Uint64 // IP packets gVisor pushed to tunnel
 	statsOutErrors  atomic.Uint64 // conn.Write failures
 	statsInPackets  atomic.Uint64 // IP packets delivered up to gVisor
-	statsInUnknown  atomic.Uint64 // bad IP version, dropped
 
 	// Per-L4-protocol counters for the inbound stream. Sniff the IP
 	// header at the LinkEndpoint level (before gVisor sees the packet),
@@ -135,10 +159,9 @@ type endpoint struct {
 	// (UDP.PacketsReceived). A growing statsInUDP with flat UDP.PacketsReceived
 	// pinpoints gVisor's IP-or-UDP demux as the loss point; a flat
 	// statsInUDP rules our code out and indicts the network/server.
-	statsInTCP   atomic.Uint64
-	statsInUDP   atomic.Uint64
-	statsInICMP  atomic.Uint64
-	statsInOther atomic.Uint64
+	statsInTCP  atomic.Uint64
+	statsInUDP  atomic.Uint64
+	statsInICMP atomic.Uint64
 
 	// statsInPanics counts inbound packets whose DeliverNetworkPacket call
 	// panicked and was recovered in endpoint.deliver. A non-zero delta means
@@ -156,8 +179,8 @@ type endpoint struct {
 	// snapshot is Swap'd to 0 each tick so the logged value reflects
 	// "worst single call in this 30s window" — not lifetime worst —
 	// which is the actionable signal for tail-latency investigation.
-	// Only 1-in-deliverSampleN packets are timed (see dispatchInbound), so
-	// this is the worst among the sampled calls, not literally every call.
+	// Only 1-in-deliverSampleN packets are timed (see inject), so this is the
+	// worst among the sampled calls, not literally every call.
 	statsMaxDeliverNs atomic.Int64
 }
 
@@ -224,18 +247,28 @@ func (*endpoint) Capabilities() stack.LinkEndpointCapabilities {
 // the dispatcher via deliverInbound called from the tunnel
 // own read loop. The endpoint still uses conn for outbound (WritePackets).
 func (e *endpoint) Attach(d stack.NetworkDispatcher) {
-	e.mu.Lock()
-	e.dispatcher = d
-	e.mu.Unlock()
-	if d != nil && !e.directDelivery {
+	if d == nil {
+		e.dispatcher.Store(nil)
+		// d == nil means the NIC is being removed (stack teardown /
+		// RemoveNIC). gVisor's removeNIC detaches us via Attach(nil) and then
+		// blocks on LinkEndpoint.Wait() BEFORE its deferred endpoint Close
+		// runs. In directDelivery mode no readLoop will ever close e.done, so
+		// we must release Wait() here or Stack().Wait()/Destroy() deadlocks.
+		// (Legacy mode leaves e.done to readLoop, which exits once its Read
+		// unblocks, preserving "Wait blocks until the worker goroutine stops".)
+		if e.directDelivery {
+			e.doneCh.Do(func() { close(e.done) })
+		}
+		return
+	}
+	e.dispatcher.Store(&d)
+	if !e.directDelivery {
 		go e.readLoop()
 	}
 }
 
 func (e *endpoint) IsAttached() bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.dispatcher != nil
+	return e.dispatcher.Load() != nil
 }
 
 func (e *endpoint) Wait() {
@@ -326,7 +359,7 @@ func (e *endpoint) readLoop() {
 		// Conn may hand back (n>0, io.EOF) from a single Read, and inspecting
 		// the error first would drop that final inbound packet.
 		if n > 0 {
-			if e.dispatchInbound(buf[:n]) {
+			if e.inject(buf[:n]) {
 				// dispatcher missing — Attach hasn't wired one or the NIC
 				// was removed. Without a sink there's nothing to do, so
 				// terminate the loop cleanly.
@@ -360,80 +393,74 @@ func (e *endpoint) readLoop() {
 	}
 }
 
-// deliverInbound is the fast-path entry for direct delivery from the
-// tunnel inbound path. ip is the plaintext IP datagram returned
-// by the AEAD decrypt; the caller is free to reuse the backing memory
-// once this returns (buffer.MakeWithData copies, see comments below).
-//
-// Stats counters and L4 bucketing mirror readLoop's behaviour so the
-// monitoring view is identical regardless of which path delivers a
-// given packet.
+// deliverInbound is the fast-path inbound entry wired via
+// PacketTunnel.SetInbound: one decrypted IP datagram in, delivered straight up
+// the stack. ip is the plaintext datagram from the AEAD decrypt; the caller is
+// free to reuse the backing memory once this returns (buffer.MakeWithData
+// copies, see inject). A missing dispatcher is treated as a per-packet drop —
+// the session keeps calling deliverInbound on subsequent packets and a late
+// Attach resumes normal flow without restarting anything.
 func (e *endpoint) deliverInbound(ip []byte) {
-	// dispatcher-missing is treated as a per-packet drop here — the
-	// session keeps calling deliverInbound on subsequent packets, and a
-	// late Attach (unlikely under direct delivery, but possible during
-	// startup) will resume normal flow without restarting anything.
-	_ = e.dispatchInbound(ip)
+	_ = e.inject(ip)
 }
 
 // deliverSampleN sets the 1-in-N sampling rate for the dispatcher-latency
-// high-water mark in dispatchInbound. Must be a power of two so the hot path
-// can pick a sample with a bitmask instead of a modulo.
+// high-water mark in inject. Must be a power of two so the hot path can pick a
+// sample with a bitmask instead of a modulo.
 const deliverSampleN = 16
 
-// dispatchInbound is the shared body used by both readLoop (legacy
-// channel-then-Tunnel.Read path, used by tests and any pre-Net.New
-// consumer) and deliverInbound (direct fast path, used by netstack.Net).
+// inject is the single inbound-delivery core. It parses the IP version to pick
+// the network protocol, buckets the L4 protocol for stats, and hands the packet
+// to the attached dispatcher. Both the direct fast path (deliverInbound, wired
+// via SetInbound) and the legacy readLoop adapter funnel through here, so the
+// monitoring view is identical regardless of which one delivered a packet.
 //
-// Returns dispatcherMissing=true when no dispatcher is attached; the
-// readLoop interprets that as a terminal "no sink" signal, while
-// deliverInbound just drops the packet and moves on.
-func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
+// Returns dispatcherMissing=true when no dispatcher is attached; readLoop
+// interprets that as a terminal "no sink" signal, while deliverInbound just
+// drops the packet and moves on.
+func (e *endpoint) inject(ip []byte) (dispatcherMissing bool) {
 	n := len(ip)
 	if n < 1 {
 		return false
 	}
-	// IP version is in the first nibble of the first byte.
 	var proto tcpip.NetworkProtocolNumber
-	var l4 uint8 // 0 == unknown/skip-bucketing
-	switch ip[0] >> 4 {
-	case 4:
+	var transProto tcpip.TransportProtocolNumber
+	switch header.IPVersion(ip) {
+	case header.IPv4Version:
 		proto = header.IPv4ProtocolNumber
-		// IPv4 protocol field is byte 9. Minimum IHL=5 (20 bytes).
-		if n >= 20 {
-			l4 = ip[9]
+		if n >= header.IPv4MinimumSize {
+			transProto = tcpip.TransportProtocolNumber(header.IPv4(ip).Protocol())
 		}
-	case 6:
+	case header.IPv6Version:
 		proto = header.IPv6ProtocolNumber
-		// IPv6 NextHeader is byte 6. Strictly, NH may be a chain of
-		// extension headers (HBH/Routing/Fragment); we don't walk
-		// them here. Mis-bucketing a fragmented or extension-laden
-		// packet as "other" is harmless for this diagnostic — we're
-		// only counting frequency, not correctness.
-		if n >= 40 {
-			l4 = ip[6]
+		// NextHeader (not the deprecated TransportProtocol) keeps this cheap:
+		// we deliberately don't walk IPv6 extension-header chains, so
+		// mis-bucketing a fragmented/extension-laden packet is harmless for a
+		// frequency-only diagnostic.
+		if n >= header.IPv6MinimumSize {
+			transProto = tcpip.TransportProtocolNumber(header.IPv6(ip).NextHeader())
 		}
 	default:
-		e.statsInUnknown.Add(1)
+		// Unknown IP version — nothing to deliver.
 		return false
 	}
-	switch l4 {
-	case 6: // TCP
-		e.statsInTCP.Add(1)
-	case 17: // UDP
-		e.statsInUDP.Add(1)
-	case 1, 58: // ICMP, ICMPv6
-		e.statsInICMP.Add(1)
-	default:
-		e.statsInOther.Add(1)
-	}
 
-	e.mu.RLock()
-	d := e.dispatcher
-	e.mu.RUnlock()
-	if d == nil {
+	dp := e.dispatcher.Load()
+	if dp == nil {
 		return true
 	}
+
+	// Bucket L4 only once we know the packet will actually be delivered, so the
+	// per-protocol counters stay consistent with statsInPackets.
+	switch transProto {
+	case header.TCPProtocolNumber:
+		e.statsInTCP.Add(1)
+	case header.UDPProtocolNumber:
+		e.statsInUDP.Add(1)
+	case header.ICMPv4ProtocolNumber, header.ICMPv6ProtocolNumber:
+		e.statsInICMP.Add(1)
+	}
+
 	// buffer.MakeWithData copies (verified in gVisor view.go:
 	// NewViewWithData → newChunk(len(data)) + v.Write(data) → copy(...)).
 	// The input slice is NOT retained, so it's safe to pass ip directly —
@@ -456,16 +483,14 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 	if measure {
 		start = time.Now()
 	}
-	e.deliver(d, proto, pkt)
+	e.deliver(*dp, proto, pkt)
 	if measure {
-		// CAS-loop the high-water mark so the operator-visible "worst single
-		// deliver" surfaces in the next stats tick without bloating state.
+		// The inbound path runs on a single goroutine, so a plain
+		// compare-and-store maintains the "worst single deliver in this window"
+		// high-water mark (the stats logger only Swaps it, once per tick).
 		elapsed := time.Since(start).Nanoseconds()
-		for {
-			cur := e.statsMaxDeliverNs.Load()
-			if elapsed <= cur || e.statsMaxDeliverNs.CompareAndSwap(cur, elapsed) {
-				break
-			}
+		if elapsed > e.statsMaxDeliverNs.Load() {
+			e.statsMaxDeliverNs.Store(elapsed)
 		}
 	}
 	return false
@@ -511,36 +536,50 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	for _, pkt := range pkts.AsSlice() {
 		// Fast path: most IP packets out of gVisor live as a single view
 		// (we built the NIC with no link header, and IP fragmentation is
-		// rare given our 1400-byte inner MTU). Single-view means we can
-		// pass the underlying bytes directly to conn.Write — zero copy,
-		// zero allocation. ToView (the previous implementation)
-		// unconditionally allocated and memcpy'd the whole packet.
-		slices := pkt.AsSlices()
+		// rare given our 1400-byte inner MTU). AsViewList exposes the views
+		// WITHOUT allocating a [][]byte the way AsSlices does, so a
+		// single-view packet really is zero-copy and zero-allocation: we
+		// slice the backing bytes (past the unused reserved prepend `off`)
+		// straight into conn.Write.
+		vl, off := pkt.AsViewList()
 		var data []byte
-		switch len(slices) {
+		switch vl.Len() {
 		case 0:
 			continue
 		case 1:
-			data = slices[0]
+			data = vl.Front().AsSlice()[off:]
 		default:
-			// Multi-view packet: must concat because conn.Write is a
-			// single sendmsg per call (a UDP datagram boundary). Reuse
-			// one growing scratch buffer across the batch so the cost
-			// is one alloc per WritePackets call max, not per packet.
-			total := 0
-			for _, s := range slices {
-				total += len(s)
+			// Multi-view packet: must concat because conn.Write is a single
+			// sendmsg per call (a UDP datagram boundary). Reuse one growing
+			// scratch buffer across the batch so the cost is one alloc per
+			// WritePackets call max, not per packet. Drop the first `off`
+			// bytes of unused reserved prepend while copying.
+			total := -off
+			for v := vl.Front(); v != nil; v = v.Next() {
+				total += v.Size()
 			}
 			if cap(scratch) < total {
 				scratch = make([]byte, total)
 			} else {
 				scratch = scratch[:total]
 			}
-			off := 0
-			for _, s := range slices {
-				off += copy(scratch[off:], s)
+			skip, w := off, 0
+			for v := vl.Front(); v != nil; v = v.Next() {
+				s := v.AsSlice()
+				if skip > 0 {
+					if skip >= len(s) {
+						skip -= len(s)
+						continue
+					}
+					s = s[skip:]
+					skip = 0
+				}
+				w += copy(scratch[w:], s)
 			}
 			data = scratch
+		}
+		if len(data) == 0 {
+			continue
 		}
 		_, err := e.conn.Write(data)
 		if err != nil {
@@ -735,11 +774,7 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	}
 
 	pr := t.Config()
-	rawMTU := int(pr.MTU)
-	if rawMTU <= 0 {
-		rawMTU = 1500
-	}
-	mtu := clampInnerMTU(uint32(rawMTU))
+	mtu := resolveMTU(pr.MTU, 0)
 
 	conn := t.TunnelConn()
 	if conn == nil {
@@ -760,6 +795,19 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		},
 		HandleLocal: false,
 	})
+
+	// stack.New already started the per-protocol worker goroutines, so every
+	// error return below must close the stack or they leak (one orphaned stack
+	// + its goroutines per failed New). s.Close signals those goroutines to
+	// exit. ep spawns no goroutine in directDelivery mode and the tunnel conn
+	// it wraps is owned by the caller, so we deliberately do NOT close ep here
+	// — a failed construction must leave the caller's conn intact.
+	ok := false
+	defer func() {
+		if !ok {
+			s.Close()
+		}
+	}()
 
 	if err := s.CreateNIC(nicID, ep); err != nil {
 		return nil, fmt.Errorf("CreateNIC: %s", err)
@@ -832,14 +880,9 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		if err := n.applyConfig(pr); err != nil && n.log != nil {
 			n.log.Error("netstack applyConfig failed on reconnect", "err", err)
 		}
-		// Unlike New (which defaults a missing MTU to 1500 then clamps), a
-		// reconnect that pushes no MTU (pr.MTU == 0) deliberately keeps the
-		// current NIC MTU instead of resetting to the default: servers
-		// rarely re-push MTU on rekey, and the value negotiated at connect
-		// time is still correct.
-		if pr.MTU > 0 {
-			n.ep.SetMTU(clampInnerMTU(uint32(pr.MTU)))
-		}
+		// resolveMTU keeps the current NIC MTU when the reconnect pushes none
+		// (pr.MTU == 0) and clamps any value it does push.
+		n.ep.SetMTU(resolveMTU(pr.MTU, n.ep.MTU()))
 
 		n.nicMu.Lock()
 		newV4, newV6 := n.localV4, n.localV6
@@ -859,6 +902,17 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 				"ip_changed", oldV4 != newV4 || oldV6 != newV6,
 			)
 		}
+		// closeActiveOnReconnect only reaches conns minted by DialContext.
+		// Conns created directly through the public Stack() accessor (e.g. a
+		// listener a consumer registered) are not tracked, yet they are just
+		// as bound to the now-stale source IP. Abort every transport endpoint
+		// still registered with the stack so they tear down too — the
+		// RTM_CHANGE-equivalent applied at the layer that owns ALL endpoints,
+		// not only the tracked ones. Abort is idempotent, so the tracked conns
+		// closeActiveOnReconnect already closed are unaffected.
+		for _, tep := range n.stack.RegisteredEndpoints() {
+			tep.Abort()
+		}
 	})
 
 	// Start the periodic stats logger so operators can see whether
@@ -868,6 +922,7 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	n.statsWG.Add(1)
 	go n.statsLoggerLoop()
 
+	ok = true
 	return n, nil
 }
 
@@ -885,6 +940,11 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 // expected behaviour; client apps retry and the new conns bind to the
 // fresh local IP.
 func (n *Net) applyConfig(pr TunConfig) error {
+	// Canonicalise addresses once on ingest so the v4/v6 family checks below
+	// (and in buildRoutes / currentLocalFullAddress) behave identically no
+	// matter which textual form the server pushed.
+	pr = normalizeTunConfig(pr)
+
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
 
@@ -925,12 +985,79 @@ func (n *Net) applyConfig(pr TunConfig) error {
 		firstErr = fmt.Errorf("v6: %w", err)
 	}
 
-	// Reinstall the route table verbatim — SetRouteTable replaces (not
-	// merges), so any old default-via-gateway entries get cleaned up
-	// automatically.
-	n.stack.SetRouteTable(buildRoutes(pr))
+	// Reinstall the route table — SetRouteTable replaces (not merges), so any
+	// old default-via-gateway entries get cleaned up automatically.
+	routes := buildRoutes(pr)
+	if firstErr != nil {
+		// A family whose address failed to install must not keep a route
+		// pointing at a NIC that has no source address of that family, or
+		// egress for it blackholes until the next successful reconnect. Drop
+		// those routes; keep the family that did install.
+		kept := routes[:0]
+		for _, r := range routes {
+			if routeFamilyInstalled(r, n.localV4.IsValid(), n.localV6.IsValid()) {
+				kept = append(kept, r)
+			}
+		}
+		routes = kept
+	}
+	n.stack.SetRouteTable(routes)
 
 	return firstErr
+}
+
+// normalizeTunConfig canonicalises every address in a TunConfig to its native
+// family form, unmapping any IPv4-mapped-IPv6 literal (::ffff:a.b.c.d →
+// a.b.c.d). applyConfig runs it on ingest so a v4 address pushed in ::ffff:
+// form isn't silently dropped by the downstream Is4() family checks. Slice
+// fields are only reallocated when an unmap actually changes an element, so the
+// common (already-native) case stays allocation-free and never mutates the
+// caller's backing array.
+func normalizeTunConfig(pr TunConfig) TunConfig {
+	pr.LocalIP = pr.LocalIP.Unmap()
+	pr.Netmask = pr.Netmask.Unmap()
+	pr.Gateway = pr.Gateway.Unmap()
+	pr.RemoteIP6 = pr.RemoteIP6.Unmap()
+	if pr.LocalIP6.IsValid() {
+		pr.LocalIP6 = netip.PrefixFrom(pr.LocalIP6.Addr().Unmap(), pr.LocalIP6.Bits())
+	}
+	pr.Routes = normalizePrefixes(pr.Routes)
+	pr.Routes6 = normalizePrefixes(pr.Routes6)
+	return pr
+}
+
+// normalizePrefixes returns ps with every prefix's address unmapped. It returns
+// ps unchanged (no allocation) when nothing is mapped; otherwise it copies so
+// the caller's slice is never mutated.
+func normalizePrefixes(ps []netip.Prefix) []netip.Prefix {
+	for i, p := range ps {
+		if !p.IsValid() || p.Addr().Unmap() == p.Addr() {
+			continue
+		}
+		out := make([]netip.Prefix, len(ps))
+		copy(out, ps)
+		for j := i; j < len(out); j++ {
+			if out[j].IsValid() {
+				out[j] = netip.PrefixFrom(out[j].Addr().Unmap(), out[j].Bits())
+			}
+		}
+		return out
+	}
+	return ps
+}
+
+// routeFamilyInstalled reports whether route r's address family currently has a
+// local address on the NIC, so applyConfig can drop routes for a family whose
+// address failed to install rather than blackhole its egress.
+func routeFamilyInstalled(r tcpip.Route, haveV4, haveV6 bool) bool {
+	switch r.Destination.ID().Len() {
+	case 4:
+		return haveV4
+	case 16:
+		return haveV6
+	default:
+		return true
+	}
 }
 
 // syncFamily reconciles one address family on the NIC, returning the
@@ -1006,10 +1133,9 @@ func (n *Net) removeAddr(addr netip.Addr) {
 func buildRoutes(pr TunConfig) []tcpip.Route {
 	var routes []tcpip.Route
 	if pr.Gateway.IsValid() && pr.Gateway.Is4() {
-		gw := pr.Gateway.As4()
 		routes = append(routes, tcpip.Route{
 			Destination: header.IPv4EmptySubnet,
-			Gateway:     tcpip.AddrFrom4(gw),
+			Gateway:     netipToTCPIPAddr(pr.Gateway),
 			NIC:         nicID,
 		})
 	}
@@ -1019,10 +1145,9 @@ func buildRoutes(pr TunConfig) []tcpip.Route {
 	// gVisor's destination-match is first-hit, so synthesising the default
 	// here is safe even when Routes6 also contains ::/0.
 	if pr.RemoteIP6.IsValid() && pr.RemoteIP6.Is6() {
-		gw := pr.RemoteIP6.As16()
 		routes = append(routes, tcpip.Route{
 			Destination: header.IPv6EmptySubnet,
-			Gateway:     tcpip.AddrFrom16(gw),
+			Gateway:     netipToTCPIPAddr(pr.RemoteIP6),
 			NIC:         nicID,
 		})
 	}
@@ -1156,75 +1281,111 @@ func (n *Net) Close() error {
 // cadence and operators can correlate them.
 const statsLogPeriod = 30 * time.Second
 
+// Metric indices into netStats. Adding a counter is a one-line edit here, in
+// snapStats (where it is read), and in metricDefs (where it is named for the
+// log) — the delta math in sub and the logging loop both range over the array,
+// so neither can silently skip or mis-pair a metric.
+const (
+	mOutPkts = iota
+	mOutErr
+	mInPkts
+	mInTCP
+	mInUDP
+	mInICMP
+	mInPanics
+	mTCPSent
+	mTCPSendErr
+	mTCPRetrans
+	mTCPResetsRcvd
+	mTCPFailedOpens
+	mTCPCurEst
+	mUDPSent
+	mUDPSendErr
+	mUDPRcvd
+	mUDPUnknownPort
+	mIPSent
+	mIPRcvd
+	mIPMalformed
+	mDropped
+	numMetrics
+)
+
 // netStats is one snapshot of the LinkEndpoint counters plus the gVisor stack
-// counters statsLoggerLoop tracks. Grouping them in a struct (rather than a
-// 22-value return) keeps the delta bookkeeping readable and turns a field
-// reordering into a compile error instead of a silently swapped metric.
-type netStats struct {
-	outPkts, outErr, inPkts, inTCP, inUDP, inICMP  uint64
-	inPanics                                       uint64
-	tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd uint64
-	tcpFailedOpens, tcpCurEst                      uint64
-	udpSent, udpSendErr, udpRcvd, udpUnknownPort   uint64
-	ipSent, ipRcvd, ipMalformed                    uint64
-	dropped                                        uint64
+// counters statsLoggerLoop tracks, indexed by the m* constants above.
+type netStats [numMetrics]uint64
+
+// metricDef names a metric for the structured log. deltaKey logs the per-window
+// delta of a monotonic counter; totalKey additionally logs its running total;
+// gaugeKey logs a gauge's current value (no delta — e.g. currently-established
+// conns). Exactly the metrics with a non-empty key for a variant are emitted.
+type metricDef struct {
+	deltaKey string
+	totalKey string
+	gaugeKey string
+}
+
+var metricDefs = [numMetrics]metricDef{
+	mOutPkts:        {deltaKey: "delta_ep_out", totalKey: "ep_out_total"},
+	mOutErr:         {deltaKey: "delta_ep_out_err", totalKey: "ep_out_err_total"},
+	mInPkts:         {deltaKey: "delta_ep_in", totalKey: "ep_in_total"},
+	mInTCP:          {deltaKey: "delta_ep_in_tcp"},
+	mInUDP:          {deltaKey: "delta_ep_in_udp", totalKey: "ep_in_udp_total"},
+	mInICMP:         {deltaKey: "delta_ep_in_icmp"},
+	mInPanics:       {deltaKey: "delta_ep_in_panics"},
+	mTCPSent:        {deltaKey: "delta_tcp_sent"},
+	mTCPSendErr:     {deltaKey: "delta_tcp_send_err"},
+	mTCPRetrans:     {deltaKey: "delta_tcp_retrans"},
+	mTCPResetsRcvd:  {deltaKey: "delta_tcp_resets_rcvd"},
+	mTCPFailedOpens: {deltaKey: "delta_tcp_failed_opens"},
+	mTCPCurEst:      {gaugeKey: "tcp_current_established"},
+	mUDPSent:        {deltaKey: "delta_udp_sent"},
+	mUDPSendErr:     {deltaKey: "delta_udp_send_err"},
+	mUDPRcvd:        {deltaKey: "delta_udp_rcvd"},
+	mUDPUnknownPort: {deltaKey: "delta_udp_unknown_port"},
+	mIPSent:         {deltaKey: "delta_ip_sent"},
+	mIPRcvd:         {deltaKey: "delta_ip_rcvd"},
+	mIPMalformed:    {deltaKey: "delta_ip_malformed"},
+	mDropped:        {deltaKey: "delta_dropped"},
 }
 
 // snapStats reads the current LinkEndpoint and gVisor stack counters.
 func (n *Net) snapStats() netStats {
 	st := n.stack.Stats()
-	return netStats{
-		outPkts:        n.ep.statsOutPackets.Load(),
-		outErr:         n.ep.statsOutErrors.Load(),
-		inPkts:         n.ep.statsInPackets.Load(),
-		inTCP:          n.ep.statsInTCP.Load(),
-		inUDP:          n.ep.statsInUDP.Load(),
-		inICMP:         n.ep.statsInICMP.Load(),
-		inPanics:       n.ep.statsInPanics.Load(),
-		tcpSent:        st.TCP.SegmentsSent.Value(),
-		tcpSendErr:     st.TCP.SegmentSendErrors.Value(),
-		tcpRetrans:     st.TCP.Retransmits.Value(),
-		tcpResetsRcvd:  st.TCP.ResetsReceived.Value(),
-		tcpFailedOpens: st.TCP.FailedConnectionAttempts.Value(),
-		tcpCurEst:      st.TCP.CurrentEstablished.Value(),
-		udpSent:        st.UDP.PacketsSent.Value(),
-		udpSendErr:     st.UDP.PacketSendErrors.Value(),
-		udpRcvd:        st.UDP.PacketsReceived.Value(),
-		udpUnknownPort: st.UDP.UnknownPortErrors.Value(),
-		ipSent:         st.IP.PacketsSent.Value(),
-		ipRcvd:         st.IP.PacketsReceived.Value(),
-		ipMalformed:    st.IP.MalformedPacketsReceived.Value(),
-		dropped:        st.DroppedPackets.Value(),
-	}
+	var s netStats
+	s[mOutPkts] = n.ep.statsOutPackets.Load()
+	s[mOutErr] = n.ep.statsOutErrors.Load()
+	s[mInPkts] = n.ep.statsInPackets.Load()
+	s[mInTCP] = n.ep.statsInTCP.Load()
+	s[mInUDP] = n.ep.statsInUDP.Load()
+	s[mInICMP] = n.ep.statsInICMP.Load()
+	s[mInPanics] = n.ep.statsInPanics.Load()
+	s[mTCPSent] = st.TCP.SegmentsSent.Value()
+	s[mTCPSendErr] = st.TCP.SegmentSendErrors.Value()
+	s[mTCPRetrans] = st.TCP.Retransmits.Value()
+	s[mTCPResetsRcvd] = st.TCP.ResetsReceived.Value()
+	s[mTCPFailedOpens] = st.TCP.FailedConnectionAttempts.Value()
+	s[mTCPCurEst] = st.TCP.CurrentEstablished.Value()
+	s[mUDPSent] = st.UDP.PacketsSent.Value()
+	s[mUDPSendErr] = st.UDP.PacketSendErrors.Value()
+	s[mUDPRcvd] = st.UDP.PacketsReceived.Value()
+	s[mUDPUnknownPort] = st.UDP.UnknownPortErrors.Value()
+	s[mIPSent] = st.IP.PacketsSent.Value()
+	s[mIPRcvd] = st.IP.PacketsReceived.Value()
+	s[mIPMalformed] = st.IP.MalformedPacketsReceived.Value()
+	s[mDropped] = st.DroppedPackets.Value()
+	return s
 }
 
-// sub returns the per-field delta s - p. These are monotonic counters that
-// never wrap in practice, so a plain subtraction is correct. tcpCurEst is a
-// gauge (currently-established conns), so its "delta" is meaningless — callers
-// log cur.tcpCurEst directly instead of d.tcpCurEst.
+// sub returns the per-metric delta s - p. These are monotonic counters that
+// never wrap in practice, so a plain subtraction is correct. The gauge metric
+// (mTCPCurEst) is also subtracted here, but its delta is meaningless and the
+// logger reads cur[mTCPCurEst] directly instead.
 func (s netStats) sub(p netStats) netStats {
-	return netStats{
-		outPkts:        s.outPkts - p.outPkts,
-		outErr:         s.outErr - p.outErr,
-		inPkts:         s.inPkts - p.inPkts,
-		inTCP:          s.inTCP - p.inTCP,
-		inUDP:          s.inUDP - p.inUDP,
-		inICMP:         s.inICMP - p.inICMP,
-		inPanics:       s.inPanics - p.inPanics,
-		tcpSent:        s.tcpSent - p.tcpSent,
-		tcpSendErr:     s.tcpSendErr - p.tcpSendErr,
-		tcpRetrans:     s.tcpRetrans - p.tcpRetrans,
-		tcpResetsRcvd:  s.tcpResetsRcvd - p.tcpResetsRcvd,
-		tcpFailedOpens: s.tcpFailedOpens - p.tcpFailedOpens,
-		udpSent:        s.udpSent - p.udpSent,
-		udpSendErr:     s.udpSendErr - p.udpSendErr,
-		udpRcvd:        s.udpRcvd - p.udpRcvd,
-		udpUnknownPort: s.udpUnknownPort - p.udpUnknownPort,
-		ipSent:         s.ipSent - p.ipSent,
-		ipRcvd:         s.ipRcvd - p.ipRcvd,
-		ipMalformed:    s.ipMalformed - p.ipMalformed,
-		dropped:        s.dropped - p.dropped,
+	var d netStats
+	for i := range s {
+		d[i] = s[i] - p[i]
 	}
+	return d
 }
 
 // statsLoggerLoop periodically logs a structured snapshot of the
@@ -1283,9 +1444,9 @@ func (n *Net) statsLoggerLoop() {
 		// tunnel. Same reasoning that retired the RST-storm watchdog
 		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
-		if d.outErr > 0 || d.tcpSendErr > 0 || d.udpSendErr > 0 ||
-			d.ipMalformed > 0 || d.dropped > 0 || d.udpUnknownPort > 0 ||
-			d.inPanics > 0 {
+		if d[mOutErr] > 0 || d[mTCPSendErr] > 0 || d[mUDPSendErr] > 0 ||
+			d[mIPMalformed] > 0 || d[mDropped] > 0 || d[mUDPUnknownPort] > 0 ||
+			d[mInPanics] > 0 {
 			level = slog.LevelWarn
 		}
 		// TCP retransmits are a symptom only as a *fraction* of segments sent:
@@ -1296,7 +1457,7 @@ func (n *Net) statsLoggerLoop() {
 		// Escalate only when retransmits exceed ~2% of what we sent this window,
 		// with a small floor so a tiny window where one or two retransmits
 		// dominate the ratio can't false-positive.
-		if d.tcpRetrans > 10 && d.tcpSent > 0 && d.tcpRetrans*100 > d.tcpSent*2 {
+		if d[mTCPRetrans] > 10 && d[mTCPSent] > 0 && d[mTCPRetrans]*100 > d[mTCPSent]*2 {
 			level = slog.LevelWarn
 		}
 		// A single gVisor dispatcher call eating >5 ms is the canonical
@@ -1310,47 +1471,32 @@ func (n *Net) statsLoggerLoop() {
 		}
 
 		if n.log != nil {
-			n.log.Log(context.Background(), level, "netstack stats",
-				"interval", statsLogPeriod,
-				// LinkEndpoint counters (deltas + totals).
-				"delta_ep_out", d.outPkts,
-				"delta_ep_out_err", d.outErr,
-				"delta_ep_in", d.inPkts,
-				"delta_ep_in_tcp", d.inTCP,
-				"delta_ep_in_udp", d.inUDP,
-				"delta_ep_in_icmp", d.inICMP,
-				"delta_ep_in_panics", d.inPanics,
-				"ep_out_total", cur.outPkts,
-				"ep_out_err_total", cur.outErr,
-				"ep_in_total", cur.inPkts,
-				"ep_in_udp_total", cur.inUDP,
-				// gVisor TCP.
-				"delta_tcp_sent", d.tcpSent,
-				"delta_tcp_send_err", d.tcpSendErr,
-				"delta_tcp_retrans", d.tcpRetrans,
-				"delta_tcp_resets_rcvd", d.tcpResetsRcvd,
-				"delta_tcp_failed_opens", d.tcpFailedOpens,
-				"tcp_current_established", cur.tcpCurEst,
-				// gVisor UDP.
-				"delta_udp_sent", d.udpSent,
-				"delta_udp_send_err", d.udpSendErr,
-				"delta_udp_rcvd", d.udpRcvd,
-				"delta_udp_unknown_port", d.udpUnknownPort,
-				// gVisor IP.
-				"delta_ip_sent", d.ipSent,
-				"delta_ip_rcvd", d.ipRcvd,
-				"delta_ip_malformed", d.ipMalformed,
-				// Catch-all.
-				"delta_dropped", d.dropped,
-				// Tail-latency probe for the direct-delivery fast path:
-				// worst single DeliverNetworkPacket call (microseconds)
-				// among the 1-in-deliverSampleN packets sampled this window
-				// (see dispatchInbound). The read loop blocks for exactly
-				// this long on the worst sampled packet — useful to spot
-				// gVisor slow paths before they manifest as OS-UDP-buffer
-				// overflow.
-				"max_deliver_us", maxDeliverUs,
-			)
+			// Build the structured args from metricDefs so the snapshot, the
+			// delta math, and the log keys can't drift out of sync. deltaKey →
+			// per-window delta, totalKey → running total, gaugeKey → current
+			// value (no delta).
+			args := make([]any, 0, 2+numMetrics*2+2)
+			args = append(args, "interval", statsLogPeriod)
+			for i := range numMetrics {
+				m := metricDefs[i]
+				if m.deltaKey != "" {
+					args = append(args, m.deltaKey, d[i])
+				}
+				if m.totalKey != "" {
+					args = append(args, m.totalKey, cur[i])
+				}
+				if m.gaugeKey != "" {
+					args = append(args, m.gaugeKey, cur[i])
+				}
+			}
+			// Tail-latency probe for the direct-delivery fast path: worst single
+			// DeliverNetworkPacket call (microseconds) among the
+			// 1-in-deliverSampleN packets sampled this window (see inject). The
+			// read loop blocks for exactly this long on the worst sampled
+			// packet — useful to spot gVisor slow paths before they manifest as
+			// OS-UDP-buffer overflow.
+			args = append(args, "max_deliver_us", maxDeliverUs)
+			n.log.Log(context.Background(), level, "netstack stats", args...)
 		}
 	}
 }
@@ -1390,20 +1536,16 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 	// have — instead of the v4 path the operator actually meant.
 	ip = ip.Unmap()
 
-	var (
-		proto tcpip.NetworkProtocolNumber
-		full  tcpip.FullAddress
-	)
+	var proto tcpip.NetworkProtocolNumber
 	switch {
 	case ip.Is4():
 		proto = ipv4.ProtocolNumber
-		full = tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(ip.As4()), Port: uint16(port64)}
 	case ip.Is6():
 		proto = ipv6.ProtocolNumber
-		full = tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom16(ip.As16()), Port: uint16(port64)}
 	default:
 		return nil, fmt.Errorf("netstack: unsupported address %q", host)
 	}
+	full := tcpip.FullAddress{NIC: nicID, Addr: netipToTCPIPAddr(ip), Port: uint16(port64)}
 
 	// Snapshot the reconnect generation BEFORE the (potentially blocking)
 	// gonet dial so finalizeDial can detect a reconnect that occurred during
@@ -1476,18 +1618,22 @@ func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.
 func (n *Net) currentLocalFullAddress(v4 bool) *tcpip.FullAddress {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
+	local := n.localV6
 	if v4 {
-		if !n.localV4.IsValid() {
-			return nil
-		}
-		a := n.localV4.As4()
-		return &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(a)}
+		local = n.localV4
 	}
-	if !n.localV6.IsValid() {
+	if !local.IsValid() {
 		return nil
 	}
-	a := n.localV6.As16()
-	return &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom16(a)}
+	return &tcpip.FullAddress{NIC: nicID, Addr: netipToTCPIPAddr(local)}
+}
+
+// netipToTCPIPAddr converts a netip.Addr into a tcpip.Address, picking the 4-
+// or 16-byte form from the slice length. Centralises the conversion so every
+// call site maps a netip.Addr the same way (the AddrFromSlice idiom also used
+// by syncFamily/removeAddr).
+func netipToTCPIPAddr(a netip.Addr) tcpip.Address {
+	return tcpip.AddrFromSlice(a.AsSlice())
 }
 
 // maskPrefixLen converts a 4-byte IPv4 netmask address into a prefix length

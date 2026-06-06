@@ -355,3 +355,28 @@ func TestDialContextUnmapsV4MappedV6(t *testing.T) {
 		t.Fatalf("LocalAddr = %q, want 10.0.0.5:... — v4-mapped literal not unmapped to v4", addr)
 	}
 }
+
+// TestNormalizeTunConfigUnmapsLocalIP is the config-side counterpart to
+// TestDialContextUnmapsV4MappedV6: a v4 address pushed in IPv4-mapped-IPv6 form
+// (::ffff:a.b.c.d) must still install the IPv4 family, not silently drop it
+// because the raw Is4() check fails on the mapped form.
+func TestNormalizeTunConfigUnmapsLocalIP(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr := TunConfig{
+		LocalIP: netip.MustParseAddr("::ffff:10.0.0.5"),
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := n.applyConfig(pr); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+	if !n.HasIPv4() {
+		t.Fatal("IPv4 family dropped for a v4-mapped LocalIP — normalization missing")
+	}
+	if got := n.LocalIP().String(); got != "10.0.0.5" {
+		t.Fatalf("LocalIP = %q, want 10.0.0.5 (v4-mapped literal not unmapped)", got)
+	}
+}
