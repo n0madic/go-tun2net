@@ -2,7 +2,7 @@
 
 A userspace **gVisor TCP/IP stack over an arbitrary packet tunnel**. Feed it
 anything that carries raw IP datagrams (one Read/Write == one IP packet) and it
-gives you an ordinary `DialContext` / `Listen` surface — no kernel TUN, no root.
+gives you an ordinary `DialContext` surface — no kernel TUN, no root.
 
 A VPN client plugs in by implementing `PacketTunnel`:
 

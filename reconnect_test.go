@@ -380,3 +380,56 @@ func TestNormalizeTunConfigUnmapsLocalIP(t *testing.T) {
 		t.Fatalf("LocalIP = %q, want 10.0.0.5 (v4-mapped literal not unmapped)", got)
 	}
 }
+
+// TestDialContextFamilySuffixValidation is the F2 regression: the "4"/"6"
+// suffix in tcp4/tcp6/udp4/udp6 is an explicit address-family contract, but the
+// dialed protocol is otherwise derived from the IP literal alone. A mismatched
+// suffix (e.g. "udp4" with an IPv6 literal) must be rejected up front, not
+// silently dialed on the literal's family.
+func TestDialContextFamilySuffixValidation(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr := TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.5"),
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := n.applyConfig(pr); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	mismatches := []struct {
+		network string
+		addr    string
+	}{
+		{"tcp4", "[2001:db8::1]:53"},
+		{"udp4", "[2001:db8::1]:53"},
+		{"tcp6", "10.0.0.1:53"},
+		{"udp6", "10.0.0.1:53"},
+	}
+	for _, tc := range mismatches {
+		t.Run(tc.network+"_mismatch", func(t *testing.T) {
+			c, err := n.DialContext(ctx, tc.network, tc.addr)
+			if err == nil {
+				_ = c.Close()
+				t.Fatalf("DialContext(%q, %q) = nil error, want a family-mismatch error", tc.network, tc.addr)
+			}
+			if !strings.Contains(err.Error(), "requires an IPv") {
+				t.Fatalf("DialContext(%q, %q) error = %v, want a family-mismatch error", tc.network, tc.addr, err)
+			}
+		})
+	}
+
+	// Positive control: a suffix that matches the literal must pass validation
+	// and bind (UDP so the dial is non-blocking).
+	c, err := n.DialContext(ctx, "udp4", "10.0.0.1:53")
+	if err != nil {
+		t.Fatalf("DialContext(udp4, v4 literal): %v", err)
+	}
+	_ = c.Close()
+}

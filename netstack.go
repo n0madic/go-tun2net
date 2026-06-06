@@ -4,7 +4,8 @@
 // datagrams (one Read/Write == one IP packet) — to a gVisor userspace TCP/IP
 // stack. The stack consumes the inbound IP packets the tunnel decrypts and
 // emits the outbound IP packets the tunnel encrypts and sends to the peer,
-// exposing the result as an ordinary DialContext / Listen surface. Any
+// exposing the result as an ordinary DialContext surface (use Stack() for the
+// raw gVisor stack if you need to build listeners or other endpoints). Any
 // pushed-IP VPN (OpenVPN, IKEv2/IPsec, WireGuard-style, …) plugs in by
 // implementing PacketTunnel.
 //
@@ -596,7 +597,8 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 }
 
 // Net is a thin facade over *stack.Stack that exposes net-like helpers
-// (DialContext / Listen / etc.) wired up to gVisor's gonet adapters.
+// (DialContext, plus Stack() for direct gVisor access) wired up to gVisor's
+// gonet adapters.
 //
 // The NIC's IPv4/IPv6 addresses and route table are *not* fixed at
 // construction time: when the underlying tunnel reconnects (and the
@@ -621,11 +623,16 @@ type Net struct {
 	prefixV4 int
 	prefixV6 int
 
-	// reconnectGen counts AutoReconnect-driven session swaps. The
-	// OnReconfigure hook bumps it (before applyConfig / closeActiveOnReconnect
-	// run); DialContext samples it before dialing and finalizeDial re-checks it
-	// after, so a reconnect racing an in-flight dial — even one that hands back
-	// the SAME tunnel IP — is detected and the conn force-closed.
+	// reconnectGen is a seqlock over the OnReconfigure reconfiguration window,
+	// not a plain swap counter: the hook bumps it ONCE on entry (to an odd
+	// value — "reconfiguration in progress") and ONCE on exit (back to even),
+	// so a completed reconnect advances it by 2. DialContext samples it before
+	// dialing and finalizeDial re-checks it after; a conn is rejected when the
+	// generation moved OR the sampled value was odd. Bumping on both edges (vs.
+	// only before reconfiguration) closes the window where a dial samples the
+	// already-incremented generation while the NIC still holds the old address:
+	// such a dial sees an odd preGen and is force-closed, even when the server
+	// hands back the SAME tunnel IP.
 	reconnectGen atomic.Uint64
 
 	closeMu sync.Mutex
@@ -855,13 +862,24 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		if n.closed {
 			return
 		}
-		// Bump the reconnect generation BEFORE applyConfig and
-		// closeActiveOnReconnect run. A DialContext whose trackConn races
-		// closeActiveOnReconnect's Range is then guaranteed to observe the
-		// bump in finalizeDial and force-close its just-registered conn — that
-		// is what catches a same-IP reconnect, which an old-vs-new IP
-		// comparison silently missed.
+		// Open the reconnect epoch: bump the generation to an ODD value to mark
+		// "reconfiguration in progress" BEFORE applyConfig and
+		// closeActiveOnReconnect run, and close it with a matching bump at the
+		// end of the hook (see deferred bump below). Two edges, not one:
+		//   - The entry bump catches a DialContext whose trackConn races
+		//     closeActiveOnReconnect's Range — it observes the changed
+		//     generation in finalizeDial and force-closes its just-registered
+		//     conn (catches a same-IP reconnect an IP comparison would miss).
+		//   - The odd value catches a DialContext that samples the generation
+		//     AFTER this bump but while the NIC still holds the old address (the
+		//     window between here and applyConfig). Its preGen is odd, so
+		//     finalizeDial rejects it even though the generation never moves
+		//     again before its re-check.
+		// The hook holds closeMu for its whole body and returns early only above
+		// (when closed), before this bump, so the odd→even invariant holds: the
+		// generation is odd exactly while a reconfiguration is in flight.
 		n.reconnectGen.Add(1)
+		defer n.reconnectGen.Add(1)
 		// Snapshot the pre-reconnect local addresses purely for log
 		// context — we used to skip closing conns when the tunnel IP
 		// stayed the same, but empirically that policy left zombie
@@ -1476,7 +1494,6 @@ func (n *Net) statsLoggerLoop() {
 			// per-window delta, totalKey → running total, gaugeKey → current
 			// value (no delta).
 			args := make([]any, 0, 2+numMetrics*2+2)
-			args = append(args, "interval", statsLogPeriod)
 			for i := range numMetrics {
 				m := metricDefs[i]
 				if m.deltaKey != "" {
@@ -1545,6 +1562,21 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 	default:
 		return nil, fmt.Errorf("netstack: unsupported address %q", host)
 	}
+	// Honour an explicit address-family suffix. The protocol above is derived
+	// purely from the literal, so without this a "tcp4"/"udp4" dial to an IPv6
+	// literal (or "tcp6"/"udp6" to an IPv4 literal) would silently proceed on
+	// the wrong family, contradicting the caller's stated intent. The check
+	// runs after Unmap, so an IPv4-mapped literal counts as its native v4 form.
+	switch network {
+	case "tcp4", "udp4":
+		if !ip.Is4() {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: fmt.Errorf("netstack: %s requires an IPv4 address, got %q", network, host)}
+		}
+	case "tcp6", "udp6":
+		if !ip.Is6() {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: fmt.Errorf("netstack: %s requires an IPv6 address, got %q", network, host)}
+		}
+	}
 	full := tcpip.FullAddress{NIC: nicID, Addr: netipToTCPIPAddr(ip), Port: uint16(port64)}
 
 	// Snapshot the reconnect generation BEFORE the (potentially blocking)
@@ -1601,9 +1633,16 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // window where the hook's Range already ran before trackConn registered us.
 // Because the hook bumps the generation BEFORE its closeActiveOnReconnect
 // Range, at least one of the two mechanisms always catches the conn.
+//
+// The guard trips when EITHER the generation moved since preGen OR preGen was
+// already odd. An odd preGen means the dial sampled it mid-reconfiguration
+// (after the hook's entry bump, before its exit bump) — the conn may be bound
+// to the old, about-to-be-replaced address and may have slipped past
+// closeActiveOnReconnect's Range, so it is rejected even though the generation
+// will not move again before this re-check.
 func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.Conn, error) {
 	tracked := n.trackConn(dialed)
-	if n.reconnectGen.Load() != preGen {
+	if n.reconnectGen.Load() != preGen || preGen&1 == 1 {
 		_ = tracked.Close()
 		return nil, &net.OpError{Op: "dial", Net: network, Err: ErrTunnelIPChanged}
 	}

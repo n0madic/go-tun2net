@@ -498,6 +498,35 @@ func TestFinalizeDialReconnectGuard(t *testing.T) {
 		}
 	})
 
+	t.Run("dial sampled mid-reconfiguration", func(t *testing.T) {
+		t.Parallel()
+		// An odd preGen means the dial sampled the generation between the
+		// OnReconfigure hook's entry and exit bumps — the conn may be bound to
+		// the about-to-be-replaced address and may have slipped past
+		// closeActiveOnReconnect's Range. finalizeDial must reject it even
+		// though the generation does not move again before the re-check.
+		n := &Net{}
+		n.reconnectGen.Add(1) // hook entered (odd = reconfiguration in progress)
+		preGen := n.reconnectGen.Load()
+		conn := &fakeCloseCounter{}
+
+		got, err := n.finalizeDial(conn, preGen, "tcp")
+		if !errors.Is(err, ErrTunnelIPChanged) {
+			t.Fatalf("err = %v, want ErrTunnelIPChanged", err)
+		}
+		if got != nil {
+			t.Fatalf("conn = %v, want nil on guard trip", got)
+		}
+		if conn.closes != 1 {
+			t.Fatalf("underlying conn closed %d times, want 1 (force-close on guard)", conn.closes)
+		}
+		count := 0
+		n.activeConns.Range(func(_, _ any) bool { count++; return true })
+		if count != 0 {
+			t.Fatalf("activeConns has %d entries after guard trip, want 0", count)
+		}
+	})
+
 	t.Run("no reconnect", func(t *testing.T) {
 		t.Parallel()
 		n := &Net{}

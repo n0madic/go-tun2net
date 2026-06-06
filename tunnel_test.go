@@ -90,10 +90,12 @@ func TestNewWiresTunnel(t *testing.T) {
 	}
 }
 
-// TestReconnectGenBumpsOnHook verifies the OnReconfigure hook bumps the
+// TestReconnectGenBumpsOnHook verifies the OnReconfigure hook advances the
 // reconnect generation even when the server hands back the SAME tunnel IP —
-// that bump is what lets finalizeDial catch a same-IP reconnect that an
-// old-vs-new IP comparison would silently miss (F1).
+// that advance is what lets finalizeDial catch a same-IP reconnect that an
+// old-vs-new IP comparison would silently miss (F1). The generation is a
+// seqlock bumped on both edges of the reconfiguration window, so one completed
+// reconnect advances it by 2 and leaves it even (no reconfiguration in flight).
 func TestReconnectGenBumpsOnHook(t *testing.T) {
 	m := newMock(t, "10.0.0.2")
 	n, err := New(m, nil)
@@ -109,8 +111,12 @@ func TestReconnectGenBumpsOnHook(t *testing.T) {
 		Gateway: netip.MustParseAddr("10.0.0.1"),
 		MTU:     1400,
 	})
-	if after := n.reconnectGen.Load(); after != before+1 {
-		t.Fatalf("reconnectGen = %d, want %d (hook must bump even on same-IP reconnect)", after, before+1)
+	after := n.reconnectGen.Load()
+	if after != before+2 {
+		t.Fatalf("reconnectGen = %d, want %d (hook must advance by 2 even on same-IP reconnect)", after, before+2)
+	}
+	if after&1 == 1 {
+		t.Fatalf("reconnectGen = %d is odd, want even after the hook returns (no reconfiguration in flight)", after)
 	}
 }
 
