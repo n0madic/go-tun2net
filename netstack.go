@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -125,21 +126,14 @@ type endpoint struct {
 	closeMu sync.Mutex
 	closed  bool
 	done    chan struct{}
-	doneCh  sync.Once // closes done at most once (readLoop OR Close)
+	doneCh  sync.Once // closes done at most once (Attach(nil) OR Close)
 
-	// directDelivery, when true, signals Attach to skip starting the
-	// reader goroutine: inbound IP packets are delivered via
-	// deliverInbound from the tunnel inbound path, not by
-	// pulling them from e.conn here. Avoids one goroutine handoff and
-	// one defensive memcpy per inbound packet.
-	directDelivery bool
-
-	// mu guards linkAddr. dispatcher is read on every inbound packet
-	// (endpoint.inject) and written only by Attach, so it lives in an
-	// atomic.Pointer to keep that hot path lock-free.
-	mu         sync.RWMutex
+	// dispatcher is read on every inbound packet (deliverInbound) and written
+	// only by Attach, so it lives in an atomic.Pointer to keep that hot path
+	// lock-free. Inbound IP packets are delivered via deliverInbound from the
+	// tunnel inbound path (PacketTunnel.SetInbound); the endpoint never reads
+	// e.conn itself — e.conn is the outbound-only pipe (WritePackets).
 	dispatcher atomic.Pointer[stack.NetworkDispatcher]
-	linkAddr   tcpip.LinkAddress
 
 	onClose func()
 
@@ -168,8 +162,15 @@ type endpoint struct {
 	// panicked and was recovered in endpoint.deliver. A non-zero delta means
 	// gVisor's dispatch hit a bug on some inbound packet; the recover keeps a
 	// single malformed packet from killing the whole inbound data path, and
-	// the stats logger escalates to WARN so the condition stays visible.
+	// the stats logger escalates to ERROR so the condition stays visible.
 	statsInPanics atomic.Uint64
+
+	// panicDetail holds the value + stack of the most recent recovered inbound
+	// dispatch panic, captured in deliver. The stats logger surfaces it at
+	// ERROR on the next tick so a black-holed traffic class is diagnosable
+	// rather than a silent counter. Stored as a *string so the hot path stays
+	// untouched until a (rare) panic actually fires.
+	panicDetail atomic.Pointer[string]
 
 	// statsMaxDeliverNs is the high-water mark of how long a single
 	// d.DeliverNetworkPacket call took (nanoseconds) since the last
@@ -189,13 +190,13 @@ type endpoint struct {
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 
 // newEndpoint wraps the given conn into a LinkEndpoint with the given MTU.
-// When directDelivery is true the endpoint does NOT spawn a reader
-// goroutine in Attach; inbound packets arrive via deliverInbound.
-func newEndpoint(conn net.Conn, mtu uint32, directDelivery bool) *endpoint {
+// Inbound packets arrive via deliverInbound (wired through
+// PacketTunnel.SetInbound); the endpoint never reads conn itself, so Attach
+// spawns no reader goroutine and conn is used only for outbound WritePackets.
+func newEndpoint(conn net.Conn, mtu uint32) *endpoint {
 	e := &endpoint{
-		conn:           conn,
-		done:           make(chan struct{}),
-		directDelivery: directDelivery,
+		conn: conn,
+		done: make(chan struct{}),
 	}
 	e.mtu.Store(mtu)
 	return e
@@ -207,17 +208,13 @@ func (e *endpoint) SetMTU(m uint32) { e.mtu.Store(m) }
 
 func (*endpoint) MaxHeaderLength() uint16 { return 0 }
 
-func (e *endpoint) LinkAddress() tcpip.LinkAddress {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.linkAddr
-}
+// LinkAddress and SetLinkAddress are required by the stack.LinkEndpoint
+// interface but carry no state here: this is a header-less, no-L2 endpoint
+// (MaxHeaderLength==0, ARPHardwareNone), so it has no link address. Returning a
+// constant keeps the per-packet gVisor LinkAddress() call lock-free.
+func (*endpoint) LinkAddress() tcpip.LinkAddress { return "" }
 
-func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.linkAddr = addr
-}
+func (*endpoint) SetLinkAddress(tcpip.LinkAddress) {}
 
 // Capabilities advertises RX checksum offload so gVisor does NOT re-verify the
 // L4 (TCP/UDP) checksum of inbound packets. Inner packets arrive from a remote
@@ -240,32 +237,23 @@ func (*endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return stack.CapabilityRXChecksumOffload
 }
 
-// Attach wires the dispatcher and (unless directDelivery is set) starts
-// the reader goroutine that pumps inbound IP packets up the stack.
-// Called once by stack.Stack.CreateNIC.
-//
-// In directDelivery mode the readLoop is skipped: inbound packets reach
-// the dispatcher via deliverInbound called from the tunnel
-// own read loop. The endpoint still uses conn for outbound (WritePackets).
+// Attach wires the dispatcher. No reader goroutine is started: inbound IP
+// packets reach the dispatcher via deliverInbound, called from the tunnel's
+// inbound fast-path (PacketTunnel.SetInbound). The endpoint uses conn only for
+// outbound (WritePackets). Called once by stack.Stack.CreateNIC.
 func (e *endpoint) Attach(d stack.NetworkDispatcher) {
 	if d == nil {
 		e.dispatcher.Store(nil)
-		// d == nil means the NIC is being removed (stack teardown /
-		// RemoveNIC). gVisor's removeNIC detaches us via Attach(nil) and then
-		// blocks on LinkEndpoint.Wait() BEFORE its deferred endpoint Close
-		// runs. In directDelivery mode no readLoop will ever close e.done, so
-		// we must release Wait() here or Stack().Wait()/Destroy() deadlocks.
-		// (Legacy mode leaves e.done to readLoop, which exits once its Read
-		// unblocks, preserving "Wait blocks until the worker goroutine stops".)
-		if e.directDelivery {
-			e.doneCh.Do(func() { close(e.done) })
-		}
+		// d == nil means the NIC is being removed (stack teardown / RemoveNIC).
+		// gVisor's removeNIC detaches us via Attach(nil) and then blocks on
+		// LinkEndpoint.Wait() BEFORE any endpoint Close runs. No reader
+		// goroutine exists to close e.done, so we must release Wait() here or
+		// Stack().Wait()/Destroy() deadlocks. sync.Once makes this idempotent
+		// with the close in Close().
+		e.doneCh.Do(func() { close(e.done) })
 		return
 	}
 	e.dispatcher.Store(&d)
-	if !e.directDelivery {
-		go e.readLoop()
-	}
 }
 
 func (e *endpoint) IsAttached() bool {
@@ -284,14 +272,12 @@ func (*endpoint) AddHeader(*stack.PacketBuffer) {}
 func (*endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
 
 // Close shuts the endpoint. The reader goroutine exits as soon as the
-// underlying Conn returns from Read with an error and sees e.closed=true.
-//
-// A tunnel Conn Close() may be a no-op (some handles survive
-// across reconnects, so closing it doesn't tear down the VPN session). To
-// unblock readLoop's pending Read we therefore poke SetReadDeadline first;
-// the subsequent Read returns os.ErrDeadlineExceeded, the loop checks
-// e.closed and exits cleanly. conn.Close() is still called so non-tunnel
-// net.Conn implementations behave normally.
+// Close shuts the endpoint. Nothing reads e.conn (inbound arrives via
+// deliverInbound), so there is no reader goroutine to wake — Close just closes
+// the conn so further outbound Write fails, and releases Wait(). conn.Close()
+// is called so non-tunnel net.Conn implementations behave normally; a tunnel
+// Conn whose Close() is a no-op (some handles survive across reconnects) is
+// unaffected because we never block on its Read. Idempotent.
 func (e *endpoint) Close() {
 	e.closeMu.Lock()
 	already := e.closed
@@ -301,22 +287,11 @@ func (e *endpoint) Close() {
 	if already {
 		return
 	}
-	if d, ok := e.conn.(interface {
-		SetReadDeadline(time.Time) error
-	}); ok {
-		// Unix(1, 0) is in the past — already-blocked Read wakes immediately
-		// and any subsequent Read returns ErrDeadlineExceeded without a
-		// syscall. Avoid time.Time{} (zero) because that clears the deadline.
-		_ = d.SetReadDeadline(time.Unix(1, 0))
-	}
 	_ = e.conn.Close()
-	// In directDelivery mode readLoop never runs, so nothing else closes
-	// e.done — drive it from Close. sync.Once makes the double-close from
-	// the legacy path (readLoop's `defer close(e.done)` + an explicit
-	// Close()) harmless. Wait() therefore returns the moment Close ran.
-	if e.directDelivery {
-		e.doneCh.Do(func() { close(e.done) })
-	}
+	// Nothing else closes e.done in the common path (Attach(nil) only fires on
+	// NIC removal), so drive it from Close. sync.Once makes the double-close
+	// with Attach(nil) harmless. Wait() returns the moment Close ran.
+	e.doneCh.Do(func() { close(e.done) })
 	if cb != nil {
 		cb()
 	}
@@ -328,101 +303,25 @@ func (e *endpoint) SetOnCloseAction(f func()) {
 	e.onClose = f
 }
 
-// readLoop reads IP packets from the tunnel and delivers them upward.
-//
-// The read buffer is sized for the maximum IP packet plus jumbo-frame
-// slack. Using a fixed maxBufSize (rather than e.MTU()+64 at startup)
-// avoids silent truncation if SetMTU bumps the MTU at runtime: net.Conn
-// for a packet-oriented tunnel doesn't signal truncation.
-const maxIPPacketLen = 65535 + 64
-
-// readLoop back-off bounds. A packet-oriented net.Conn that returns a
-// non-terminal error (e.g. a persistent i/o timeout) on every Read must not be
-// allowed to spin the loop at 100% CPU. We sleep readErrBackoff between
-// consecutive failures and abandon the loop after maxConsecutiveReadErrors of
-// them — a conn that errors for ~1s straight is treated as permanently dead.
-const (
-	readErrBackoff           = 10 * time.Millisecond
-	maxConsecutiveReadErrors = 100
-)
-
-func (e *endpoint) readLoop() {
-	defer e.doneCh.Do(func() { close(e.done) })
-	buf := make([]byte, maxIPPacketLen)
-	// consecutiveErrs counts back-to-back non-terminal Read errors; a
-	// successful read resets it. It bounds the back-off below so a conn
-	// wedged in a permanent error state can neither busy-spin nor loop
-	// forever.
-	var consecutiveErrs int
-	for {
-		n, err := e.conn.Read(buf)
-		// Deliver any bytes returned BEFORE inspecting err: a packet-oriented
-		// Conn may hand back (n>0, io.EOF) from a single Read, and inspecting
-		// the error first would drop that final inbound packet.
-		if n > 0 {
-			if e.inject(buf[:n]) {
-				// dispatcher missing — Attach hasn't wired one or the NIC
-				// was removed. Without a sink there's nothing to do, so
-				// terminate the loop cleanly.
-				return
-			}
-		}
-		if err != nil {
-			// Any error on a closed endpoint terminates the loop.
-			e.closeMu.Lock()
-			closed := e.closed
-			e.closeMu.Unlock()
-			if closed {
-				return
-			}
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
-				errors.Is(err, net.ErrClosed) {
-				return
-			}
-			// Non-terminal error: the conn may still be alive (e.g. a
-			// transient i/o timeout). Back off so we don't busy-spin at 100%
-			// CPU, and give up once it's clear the conn will never recover
-			// rather than looping on the same error forever.
-			consecutiveErrs++
-			if consecutiveErrs >= maxConsecutiveReadErrors {
-				return
-			}
-			time.Sleep(readErrBackoff)
-			continue
-		}
-		consecutiveErrs = 0
-	}
-}
-
-// deliverInbound is the fast-path inbound entry wired via
-// PacketTunnel.SetInbound: one decrypted IP datagram in, delivered straight up
-// the stack. ip is the plaintext datagram from the AEAD decrypt; the caller is
-// free to reuse the backing memory once this returns (buffer.MakeWithData
-// copies, see inject). A missing dispatcher is treated as a per-packet drop —
-// the session keeps calling deliverInbound on subsequent packets and a late
-// Attach resumes normal flow without restarting anything.
-func (e *endpoint) deliverInbound(ip []byte) {
-	_ = e.inject(ip)
-}
-
 // deliverSampleN sets the 1-in-N sampling rate for the dispatcher-latency
-// high-water mark in inject. Must be a power of two so the hot path can pick a
-// sample with a bitmask instead of a modulo.
+// high-water mark in deliverInbound. Must be a power of two so the hot path can
+// pick a sample with a bitmask instead of a modulo.
 const deliverSampleN = 16
 
-// inject is the single inbound-delivery core. It parses the IP version to pick
-// the network protocol, buckets the L4 protocol for stats, and hands the packet
-// to the attached dispatcher. Both the direct fast path (deliverInbound, wired
-// via SetInbound) and the legacy readLoop adapter funnel through here, so the
-// monitoring view is identical regardless of which one delivered a packet.
+// deliverInbound is the inbound entry wired via PacketTunnel.SetInbound: one
+// decrypted IP datagram in, delivered straight up the stack. It parses the IP
+// version to pick the network protocol, buckets the L4 protocol for stats, and
+// hands the packet to the attached dispatcher.
 //
-// Returns dispatcherMissing=true when no dispatcher is attached; readLoop
-// interprets that as a terminal "no sink" signal, while deliverInbound just
-// drops the packet and moves on.
-func (e *endpoint) inject(ip []byte) (dispatcherMissing bool) {
+// ip is the plaintext datagram from the AEAD decrypt; the caller is free to
+// reuse the backing memory once this returns (buffer.MakeWithData copies, see
+// below). A missing dispatcher is a per-packet drop — the session keeps calling
+// deliverInbound on subsequent packets and a late Attach resumes normal flow
+// without restarting anything.
+func (e *endpoint) deliverInbound(ip []byte) {
 	n := len(ip)
 	if n < 1 {
-		return false
+		return
 	}
 	var proto tcpip.NetworkProtocolNumber
 	var transProto tcpip.TransportProtocolNumber
@@ -443,12 +342,12 @@ func (e *endpoint) inject(ip []byte) (dispatcherMissing bool) {
 		}
 	default:
 		// Unknown IP version — nothing to deliver.
-		return false
+		return
 	}
 
 	dp := e.dispatcher.Load()
 	if dp == nil {
-		return true
+		return
 	}
 
 	// Bucket L4 only once we know the packet will actually be delivered, so the
@@ -466,7 +365,7 @@ func (e *endpoint) inject(ip []byte) (dispatcherMissing bool) {
 	// NewViewWithData → newChunk(len(data)) + v.Write(data) → copy(...)).
 	// The input slice is NOT retained, so it's safe to pass ip directly —
 	// no defensive `append([]byte(nil), ip...)` needed even when the
-	// caller (readLoop or session.handleDataIn) reuses the backing array.
+	// caller (session.handleDataIn) reuses the backing array.
 	// TestDeliverInboundCopiesPayload guards this assumption against a
 	// future gVisor bump that might switch MakeWithData to zero-copy.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -486,36 +385,69 @@ func (e *endpoint) inject(ip []byte) (dispatcherMissing bool) {
 	}
 	e.deliver(*dp, proto, pkt)
 	if measure {
-		// The inbound path runs on a single goroutine, so a plain
-		// compare-and-store maintains the "worst single deliver in this window"
-		// high-water mark (the stats logger only Swaps it, once per tick).
+		// Maintain the "worst single deliver in this window" high-water mark
+		// with a CAS loop. The inbound path is single-goroutine, but the stats
+		// logger concurrently Swap(0)s this value once per tick; a plain
+		// load-then-store would race that Swap (drop a sample or write into the
+		// wrong window). The CAS makes the update a single linearizable op.
 		elapsed := time.Since(start).Nanoseconds()
-		if elapsed > e.statsMaxDeliverNs.Load() {
-			e.statsMaxDeliverNs.Store(elapsed)
+		for {
+			cur := e.statsMaxDeliverNs.Load()
+			if elapsed <= cur || e.statsMaxDeliverNs.CompareAndSwap(cur, elapsed) {
+				break
+			}
 		}
 	}
-	return false
 }
 
 // deliver hands one inbound PacketBuffer to the dispatcher with two
 // guarantees: the buffer's ref is always released (the deferred DecRef runs
 // even on a panic), and a panic inside gVisor's dispatch — e.g. a malformed
 // inbound packet tripping a bug deep in the IP/transport demux — is recovered
-// so it kills only this one packet, not the entire inbound data path (in
-// direct-delivery mode that path is the session read loop, so an unrecovered
-// panic would tear down the whole tunnel). Recovered panics are counted in
-// statsInPanics and surface as a WARN in the next stats tick. The single
-// deferred closure costs a few nanoseconds per packet — a worthwhile premium
-// for not letting one bad packet take down the data plane.
+// so it kills only this one packet, not the entire inbound data path (that path
+// is the session read loop, so an unrecovered panic would tear down the whole
+// tunnel).
+//
+// The recover does NOT re-panic, even on a runtime.Error: inbound bytes are
+// network-controlled (the VPN server forwards internet traffic into the
+// tunnel), so crashing here would hand a remote peer a denial-of-service
+// trigger — a single crafted packet that trips a gVisor bug could kill the
+// client on every retransmit. Instead the value + stack are captured into
+// panicDetail and the stats logger surfaces them at ERROR on the next tick, so
+// a deterministically black-holed traffic class is diagnosable rather than a
+// silent counter. The single deferred closure costs a few nanoseconds per
+// packet — a worthwhile premium for not letting one bad packet take down the
+// data plane.
 func (e *endpoint) deliver(d stack.NetworkDispatcher, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	defer func() {
 		pkt.DecRef()
 		if r := recover(); r != nil {
 			e.statsInPanics.Add(1)
+			detail := fmt.Sprintf("%v\n%s", r, debug.Stack())
+			e.panicDetail.Store(&detail)
 		}
 	}()
 	d.DeliverNetworkPacket(proto, pkt)
 }
+
+// writeTimeout bounds how long a stalled conn.Write may block. A packet
+// tunnel's Write is normally non-blocking, but during a reconnect/rekey the
+// underlying transport can stall; an unbounded stall on the data path
+// propagates into any goroutine driving an outbound send — including the
+// OnReconfigure hook's Abort sweep, which holds Net.closeMu and would otherwise
+// pin teardown (a concurrent Net.Close() blocks on the same lock).
+//
+// SetWriteDeadline is a single per-conn (per-fd) property, and gVisor drives
+// WritePackets concurrently from many transport goroutines, so this is NOT a
+// strict per-batch bound: a wedged write is released roughly writeTimeout after
+// the LAST concurrent arm, not after its own. That looseness is benign here —
+// in the stall case the fix targets, every writer to the wedged conn blocks
+// inside conn.Write and so cannot re-arm, freezing the deadline and making the
+// ~writeTimeout bound hold; and even in the worst case it is strictly better
+// than the prior code, which had no deadline and blocked forever. The value is
+// far above any healthy write latency, so it never trips under normal load; on
+// timeout the write fails and gVisor TCP retransmits, the correct recovery.
+const writeTimeout = 5 * time.Second
 
 // WritePackets serialises each PacketBuffer to a single IP datagram and
 // writes it to the underlying tunnel Conn.
@@ -532,6 +464,14 @@ func (e *endpoint) deliver(d stack.NetworkDispatcher, proto tcpip.NetworkProtoco
 // AEAD seal remains per-packet (the cipher state isn't batchable) so
 // the saving is the syscall ratio, not the crypto.
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	// Arm a write deadline so a stalled conn.Write can't block forever (one
+	// syscall per batch, not per packet). The deadline is conn-wide and re-armed
+	// by every concurrent WritePackets caller, so it bounds a wedged write to
+	// roughly writeTimeout after the last arm rather than strictly per batch —
+	// see the writeTimeout doc for why that is benign and still an improvement.
+	if d, ok := e.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = d.SetWriteDeadline(time.Now().Add(writeTimeout))
+	}
 	var wrote int
 	var scratch []byte
 	for _, pkt := range pkts.AsSlice() {
@@ -698,16 +638,18 @@ func (t *trackedConn) Close() error {
 	return err
 }
 
-// CloseWrite forwards to the underlying conn if it supports half-
-// close (gVisor's *TCPConn does). For conns that don't (UDP), it's
-// a no-op returning nil — the type assertion succeeds but does
-// nothing meaningful, which matches the "do half-close if possible,
-// else nothing" pattern callers expect.
+// CloseWrite forwards to the underlying conn if it supports half-close
+// (gVisor's *TCPConn does). For conns that don't (gVisor's *UDPConn), it
+// returns errors.ErrUnsupported rather than a misleading nil: a caller that
+// type-asserts interface{ CloseWrite() error } and checks the result can then
+// tell a real half-close from a no-op, instead of believing the write side was
+// shut down when nothing happened. (A caller that ignores the error sees no
+// behaviour change.)
 func (t *trackedConn) CloseWrite() error {
 	if cw, ok := t.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return nil
+	return errors.ErrUnsupported
 }
 
 // CloseRead is symmetric to CloseWrite.
@@ -715,7 +657,7 @@ func (t *trackedConn) CloseRead() error {
 	if cr, ok := t.Conn.(interface{ CloseRead() error }); ok {
 		return cr.CloseRead()
 	}
-	return nil
+	return errors.ErrUnsupported
 }
 
 // trackedPacketConn extends trackedConn with the net.PacketConn surface
@@ -730,8 +672,23 @@ type trackedPacketConn struct {
 	pc net.PacketConn
 }
 
-func (t *trackedPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return t.pc.ReadFrom(p) }
-func (t *trackedPacketConn) WriteTo(p []byte, a net.Addr) (int, error) { return t.pc.WriteTo(p, a) }
+func (t *trackedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) { return t.pc.ReadFrom(p) }
+
+// WriteTo forwards to the gonet *UDPConn, but first rejects any non-*net.UDPAddr
+// destination: gonet's UDPConn.WriteTo does an unchecked addr.(*net.UDPAddr)
+// assertion, so forwarding a *net.TCPAddr / *net.IPAddr / custom net.Addr would
+// panic on the caller's goroutine (uncaught — deliver's recover only guards the
+// inbound path). A nil addr is allowed through (gonet treats it as the
+// connected-write case).
+func (t *trackedPacketConn) WriteTo(p []byte, a net.Addr) (int, error) {
+	if a != nil {
+		if _, ok := a.(*net.UDPAddr); !ok {
+			return 0, &net.OpError{Op: "write", Net: "udp", Addr: a,
+				Err: fmt.Errorf("netstack: WriteTo requires *net.UDPAddr, got %T", a)}
+		}
+	}
+	return t.pc.WriteTo(p, a)
+}
 
 // trackConn wraps a fresh conn from gonet into a trackedConn and
 // registers it in activeConns. The returned conn is always safe to
@@ -787,7 +744,7 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	if conn == nil {
 		return nil, errors.New("tun2net: packet tunnel returned nil TunnelConn")
 	}
-	ep := newEndpoint(conn, mtu, true /* directDelivery */)
+	ep := newEndpoint(conn, mtu)
 
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
@@ -806,9 +763,9 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 	// stack.New already started the per-protocol worker goroutines, so every
 	// error return below must close the stack or they leak (one orphaned stack
 	// + its goroutines per failed New). s.Close signals those goroutines to
-	// exit. ep spawns no goroutine in directDelivery mode and the tunnel conn
-	// it wraps is owned by the caller, so we deliberately do NOT close ep here
-	// — a failed construction must leave the caller's conn intact.
+	// exit. ep spawns no goroutine and the tunnel conn it wraps is owned by the
+	// caller, so we deliberately do NOT close ep here — a failed construction
+	// must leave the caller's conn intact.
 	ok := false
 	defer func() {
 		if !ok {
@@ -837,7 +794,7 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 
 	// Wire the fast-path: every decrypted inbound IP packet from the
 	// session lands here synchronously on the session's read loop,
-	// skipping ingressCh + Tunnel.Read + endpoint.readLoop. We keep
+	// skipping ingressCh + Tunnel.Read + a reader-goroutine handoff. We keep
 	// the returned detach func and use it from Net.Close — that's a
 	// CAS-guarded clear that only fires if our handler is still the
 	// registered one, so if another consumer replaced us on the Client
@@ -905,6 +862,7 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 		n.nicMu.Lock()
 		newV4, newV6 := n.localV4, n.localV6
 		n.nicMu.Unlock()
+		ipChanged := oldV4 != newV4 || oldV6 != newV6
 
 		// Force-close every tracked conn unconditionally. Architectural
 		// equivalent of the OS kernel's RTM_CHANGE on utun: apps see
@@ -917,18 +875,28 @@ func New(t PacketTunnel, log *slog.Logger) (*Net, error) {
 				"count", closed,
 				"old_v4", oldV4, "new_v4", newV4,
 				"old_v6", oldV6, "new_v6", newV6,
-				"ip_changed", oldV4 != newV4 || oldV6 != newV6,
+				"ip_changed", ipChanged,
 			)
 		}
 		// closeActiveOnReconnect only reaches conns minted by DialContext.
-		// Conns created directly through the public Stack() accessor (e.g. a
-		// listener a consumer registered) are not tracked, yet they are just
-		// as bound to the now-stale source IP. Abort every transport endpoint
-		// still registered with the stack so they tear down too — the
-		// RTM_CHANGE-equivalent applied at the layer that owns ALL endpoints,
-		// not only the tracked ones. Abort is idempotent, so the tracked conns
-		// closeActiveOnReconnect already closed are unaffected.
+		// Conns created directly through the public Stack() accessor are not
+		// tracked, yet a CONNECTED one is just as bound to the now-stale server
+		// session, so abort it too (idempotent for the tracked conns already
+		// closed above). A TCP LISTENER is different: it is not a zombie bound
+		// to a stale 4-tuple. On a same-IP reconnect its binding is still valid,
+		// and aborting it would permanently break a consumer's server (Accept
+		// starts erroring) on every rekey — so skip listeners unless the tunnel
+		// IP actually changed (then the old-IP binding really is stale). Only a
+		// TCP endpoint reports StateListen (value 10); no UDP/ICMP datagram
+		// state (1..4) collides with it, so the cross-protocol State() read is
+		// safe.
 		for _, tep := range n.stack.RegisteredEndpoints() {
+			if !ipChanged {
+				if se, ok := tep.(interface{ State() uint32 }); ok &&
+					tcp.EndpointState(se.State()) == tcp.StateListen {
+					continue
+				}
+			}
 			tep.Abort()
 		}
 	})
@@ -1213,39 +1181,36 @@ func buildRoutes(pr TunConfig) []tcpip.Route {
 // listeners, packet endpoints, sockopts, etc.
 func (n *Net) Stack() *stack.Stack { return n.stack }
 
-// LocalIP returns the IPv4 address assigned to the tunnel (from PUSH_REPLY).
-func (n *Net) LocalIP() netip.Addr {
+// localAddr returns the NIC's currently-installed address for one family
+// (v4==true → IPv4, else IPv6), read under nicMu. It is the single locked-read
+// primitive the public family accessors and the dial laddr path are built on,
+// so the closeMu→nicMu lock order is honoured in exactly one place.
+func (n *Net) localAddr(v4 bool) netip.Addr {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
-	return n.localV4
+	if v4 {
+		return n.localV4
+	}
+	return n.localV6
 }
+
+// LocalIP returns the IPv4 address assigned to the tunnel (from PUSH_REPLY).
+func (n *Net) LocalIP() netip.Addr { return n.localAddr(true) }
 
 // LocalIP6 returns the IPv6 address assigned to the tunnel (from PUSH_REPLY's
 // "ifconfig-ipv6" directive). Returns a zero value when the server did not
 // push an IPv6 address.
-func (n *Net) LocalIP6() netip.Addr {
-	n.nicMu.Lock()
-	defer n.nicMu.Unlock()
-	return n.localV6
-}
+func (n *Net) LocalIP6() netip.Addr { return n.localAddr(false) }
 
 // HasIPv4 reports whether the NIC has an IPv4 address from the latest
 // PUSH_REPLY. Callers use this to skip v4 dials when no v4 is configured.
-func (n *Net) HasIPv4() bool {
-	n.nicMu.Lock()
-	defer n.nicMu.Unlock()
-	return n.localV4.IsValid()
-}
+func (n *Net) HasIPv4() bool { return n.localAddr(true).IsValid() }
 
 // HasIPv6 reports whether the NIC has an IPv6 address from the latest
 // PUSH_REPLY. Callers use this to fail fast on v6 dials when the server
 // did not push an IPv6 address — gVisor would otherwise spend a route
 // lookup and return ErrHostUnreachable, which is slower and noisier.
-func (n *Net) HasIPv6() bool {
-	n.nicMu.Lock()
-	defer n.nicMu.Unlock()
-	return n.localV6.IsValid()
-}
+func (n *Net) HasIPv6() bool { return n.localAddr(false).IsValid() }
 
 // Close tears down the netstack but leaves the underlying tunnel
 // running. The tunnel Conn it was using is closed (so further Read/Write on
@@ -1366,6 +1331,28 @@ var metricDefs = [numMetrics]metricDef{
 	mDropped:        {deltaKey: "delta_dropped"},
 }
 
+// statsArgCap is the exact number of key/value slots a stats-log line emits,
+// derived from metricDefs so it never drifts: each non-empty delta/total/gauge
+// key contributes one key+value pair (2 slots), plus the trailing
+// max_deliver_us pair. Computed once at init rather than guessed by a formula
+// (the previous 2+numMetrics*2+2 hint under-counted because four metrics emit
+// both a delta and a total, forcing a re-alloc every tick).
+var statsArgCap = func() int {
+	n := 2 // max_deliver_us
+	for _, m := range metricDefs {
+		if m.deltaKey != "" {
+			n += 2
+		}
+		if m.totalKey != "" {
+			n += 2
+		}
+		if m.gaugeKey != "" {
+			n += 2
+		}
+	}
+	return n
+}()
+
 // snapStats reads the current LinkEndpoint and gVisor stack counters.
 func (n *Net) snapStats() netStats {
 	st := n.stack.Stats()
@@ -1429,7 +1416,11 @@ func (n *Net) statsLoggerLoop() {
 	t := time.NewTicker(statsLogPeriod)
 	defer t.Stop()
 
-	var prev netStats
+	// Seed prev with a baseline snapshot taken now (at loop start the counters
+	// are ~0), so the first tick logs a real first-window delta instead of
+	// subtracting from a zero netStats — which would treat the cumulative gVisor
+	// counters as the delta and could spuriously WARN on the very first line.
+	prev := n.snapStats()
 	for {
 		select {
 		case <-n.statsStop:
@@ -1463,8 +1454,7 @@ func (n *Net) statsLoggerLoop() {
 		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
 		if d[mOutErr] > 0 || d[mTCPSendErr] > 0 || d[mUDPSendErr] > 0 ||
-			d[mIPMalformed] > 0 || d[mDropped] > 0 || d[mUDPUnknownPort] > 0 ||
-			d[mInPanics] > 0 {
+			d[mIPMalformed] > 0 || d[mDropped] > 0 || d[mUDPUnknownPort] > 0 {
 			level = slog.LevelWarn
 		}
 		// TCP retransmits are a symptom only as a *fraction* of segments sent:
@@ -1487,13 +1477,21 @@ func (n *Net) statsLoggerLoop() {
 		if maxDeliverUs > 5_000 {
 			level = slog.LevelWarn
 		}
+		// A recovered panic in gVisor's inbound dispatch is the most serious
+		// signal: the offending packet shape can never be delivered, so a whole
+		// traffic class may be silently black-holed. Escalate to ERROR (above
+		// any WARN above) and attach the captured panic + stack below so the
+		// condition is actionable rather than a bare counter.
+		if d[mInPanics] > 0 {
+			level = slog.LevelError
+		}
 
 		if n.log != nil {
 			// Build the structured args from metricDefs so the snapshot, the
 			// delta math, and the log keys can't drift out of sync. deltaKey →
 			// per-window delta, totalKey → running total, gaugeKey → current
 			// value (no delta).
-			args := make([]any, 0, 2+numMetrics*2+2)
+			args := make([]any, 0, statsArgCap)
 			for i := range numMetrics {
 				m := metricDefs[i]
 				if m.deltaKey != "" {
@@ -1506,13 +1504,21 @@ func (n *Net) statsLoggerLoop() {
 					args = append(args, m.gaugeKey, cur[i])
 				}
 			}
-			// Tail-latency probe for the direct-delivery fast path: worst single
+			// Tail-latency probe for the inbound fast path: worst single
 			// DeliverNetworkPacket call (microseconds) among the
-			// 1-in-deliverSampleN packets sampled this window (see inject). The
-			// read loop blocks for exactly this long on the worst sampled
-			// packet — useful to spot gVisor slow paths before they manifest as
-			// OS-UDP-buffer overflow.
+			// 1-in-deliverSampleN packets sampled this window (see
+			// deliverInbound). The session read loop blocks for exactly this long
+			// on the worst sampled packet — useful to spot gVisor slow paths
+			// before they manifest as OS-UDP-buffer overflow.
 			args = append(args, "max_deliver_us", maxDeliverUs)
+			// On a recovered inbound-dispatch panic, attach the captured value +
+			// stack so the ERROR line is self-contained (rare path: a realloc
+			// past statsArgCap here is fine).
+			if d[mInPanics] > 0 {
+				if pd := n.ep.panicDetail.Load(); pd != nil {
+					args = append(args, "last_panic", *pd)
+				}
+			}
 			n.log.Log(context.Background(), level, "netstack stats", args...)
 		}
 	}
@@ -1634,14 +1640,31 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // Because the hook bumps the generation BEFORE its closeActiveOnReconnect
 // Range, at least one of the two mechanisms always catches the conn.
 //
-// The guard trips when EITHER the generation moved since preGen OR preGen was
-// already odd. An odd preGen means the dial sampled it mid-reconfiguration
-// (after the hook's entry bump, before its exit bump) — the conn may be bound
-// to the old, about-to-be-replaced address and may have slipped past
-// closeActiveOnReconnect's Range, so it is rejected even though the generation
-// will not move again before this re-check.
+// The reconnect guard trips when EITHER the generation moved since preGen OR
+// preGen was already odd. An odd preGen means the dial sampled it
+// mid-reconfiguration (after the hook's entry bump, before its exit bump) — the
+// conn may be bound to the old, about-to-be-replaced address and may have
+// slipped past closeActiveOnReconnect's Range, so it is rejected even though the
+// generation will not move again before this re-check.
+//
+// finalizeDial also rejects a dial that raced Net.Close(): Close sets n.closed
+// (but does not move reconnectGen), so without this check a dial completing
+// after n.closed=true could be handed back with a nil error — a conn bound to a
+// stack being destroyed, plus a leaked activeConns entry Close never drains.
+// Reading n.closed under closeMu serialises the two: Close either tore down
+// first (we see closed and reject with net.ErrClosed, which — unlike
+// ErrTunnelIPChanged — is not retryable, so callers stop) or it runs after this
+// returns. The closed branch is checked first so a closing Net never reports
+// the retryable ErrTunnelIPChanged.
 func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.Conn, error) {
 	tracked := n.trackConn(dialed)
+	n.closeMu.Lock()
+	closed := n.closed
+	n.closeMu.Unlock()
+	if closed {
+		_ = tracked.Close()
+		return nil, &net.OpError{Op: "dial", Net: network, Err: net.ErrClosed}
+	}
 	if n.reconnectGen.Load() != preGen || preGen&1 == 1 {
 		_ = tracked.Close()
 		return nil, &net.OpError{Op: "dial", Net: network, Err: ErrTunnelIPChanged}
@@ -1655,12 +1678,7 @@ func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.
 // installed — gonet treats nil laddr as "auto-pick", matching the prior
 // behaviour for that edge case.
 func (n *Net) currentLocalFullAddress(v4 bool) *tcpip.FullAddress {
-	n.nicMu.Lock()
-	defer n.nicMu.Unlock()
-	local := n.localV6
-	if v4 {
-		local = n.localV4
-	}
+	local := n.localAddr(v4)
 	if !local.IsValid() {
 		return nil
 	}

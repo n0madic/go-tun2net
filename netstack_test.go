@@ -5,7 +5,6 @@ package tun2net
 import (
 	"bytes"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -65,16 +64,17 @@ func (f *fakeDispatcher) waitPacket(t *testing.T, timeout time.Duration) capture
 	return pkt
 }
 
-// TestEndpointInbound feeds raw IP bytes into the tunnel side of the pipe
-// and verifies that the LinkEndpoint delivers them as a PacketBuffer with
-// the correct NetworkProtocolNumber.
+// TestEndpointInbound delivers raw IP bytes via the inbound fast-path
+// (deliverInbound, as PacketTunnel.SetInbound would) and verifies that the
+// LinkEndpoint hands them to the dispatcher as a PacketBuffer with the correct
+// NetworkProtocolNumber.
 func TestEndpointInbound(t *testing.T) {
 	t.Parallel()
 
 	cliConn, srvConn := net.Pipe()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500, false)
+	ep := newEndpoint(cliConn, 1500)
 	disp := newFakeDispatcher()
 	ep.Attach(disp)
 	defer ep.Close()
@@ -86,9 +86,7 @@ func TestEndpointInbound(t *testing.T) {
 		0x40, 0x01, 0x00, 0x00, 10, 8, 0, 100,
 		10, 8, 0, 1,
 	}
-	if _, err := srvConn.Write(ipv4Pkt); err != nil {
-		t.Fatalf("write into pipe: %v", err)
-	}
+	ep.deliverInbound(ipv4Pkt)
 
 	got := disp.waitPacket(t, 2*time.Second)
 	if got.proto != header.IPv4ProtocolNumber {
@@ -106,9 +104,7 @@ func TestEndpointInbound(t *testing.T) {
 		// dst ::1
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 	}
-	if _, err := srvConn.Write(ipv6Pkt); err != nil {
-		t.Fatalf("write v6 into pipe: %v", err)
-	}
+	ep.deliverInbound(ipv6Pkt)
 	got = disp.waitPacket(t, 2*time.Second)
 	if got.proto != header.IPv6ProtocolNumber {
 		t.Fatalf("v6 proto = %d, want IPv6 (%d)", got.proto, header.IPv6ProtocolNumber)
@@ -142,7 +138,7 @@ func TestDeliverInboundCopiesPayload(t *testing.T) {
 	cliConn, srvConn := net.Pipe()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500, true /* directDelivery: no readLoop */)
+	ep := newEndpoint(cliConn, 1500)
 	disp := &retainingDispatcher{}
 	ep.Attach(disp)
 	defer ep.Close()
@@ -183,7 +179,7 @@ func TestEndpointOutbound(t *testing.T) {
 	defer func() { _ = cliConn.Close() }()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500, false)
+	ep := newEndpoint(cliConn, 1500)
 	defer ep.Close()
 	// Attach is required by some stack code paths, but WritePackets does not
 	// gate on it. We still Attach a dispatcher to keep the lifecycle realistic.
@@ -222,15 +218,16 @@ func TestEndpointOutbound(t *testing.T) {
 	}
 }
 
-// TestEndpointCloseUnblocksReader: closing the endpoint must release the
-// blocking Read in the inbound goroutine.
-func TestEndpointCloseUnblocksReader(t *testing.T) {
+// TestEndpointCloseUnblocksWait: closing the endpoint must release Wait()
+// (which gVisor blocks on during NIC teardown). There is no reader goroutine —
+// Close drives e.done directly via the doneCh sync.Once.
+func TestEndpointCloseUnblocksWait(t *testing.T) {
 	t.Parallel()
 
 	cliConn, srvConn := net.Pipe()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500, false)
+	ep := newEndpoint(cliConn, 1500)
 	ep.Attach(newFakeDispatcher())
 
 	done := make(chan struct{})
@@ -243,7 +240,7 @@ func TestEndpointCloseUnblocksReader(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("readLoop did not exit after Close")
+		t.Fatal("Wait did not return after Close")
 	}
 }
 
@@ -551,59 +548,6 @@ func TestFinalizeDialReconnectGuard(t *testing.T) {
 	})
 }
 
-// eofConn is a net.Conn whose single Read returns a full packet together with
-// io.EOF — the (n>0, err!=nil) shape a packet-oriented conn may produce — and
-// io.EOF with no data thereafter. Used to prove readLoop delivers the final
-// packet before honouring the terminal error.
-type eofConn struct {
-	fakeCloseCounter
-	mu   sync.Mutex
-	data []byte
-	done bool
-}
-
-func (c *eofConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.done {
-		return 0, io.EOF
-	}
-	c.done = true
-	return copy(p, c.data), io.EOF
-}
-
-// TestReadLoopDeliversFinalPacketWithEOF is the F5 regression: a Read that
-// returns (n>0, io.EOF) in one call must still have its payload delivered
-// before the loop honours the EOF and exits.
-func TestReadLoopDeliversFinalPacketWithEOF(t *testing.T) {
-	t.Parallel()
-
-	ipv4Pkt := []byte{
-		0x45, 0x00, 0x00, 0x14, 0xab, 0xcd, 0x00, 0x00,
-		0x40, 0x01, 0x00, 0x00, 10, 8, 0, 100,
-		10, 8, 0, 1,
-	}
-	conn := &eofConn{data: append([]byte(nil), ipv4Pkt...)}
-	ep := newEndpoint(conn, 1500, false /* directDelivery=false → readLoop runs */)
-	disp := newFakeDispatcher()
-	ep.Attach(disp)
-	defer ep.Close()
-
-	got := disp.waitPacket(t, 2*time.Second)
-	if !bytes.Equal(got.body, ipv4Pkt) {
-		t.Fatalf("final packet not delivered before EOF:\n got: %x\nwant: %x", got.body, ipv4Pkt)
-	}
-
-	// readLoop must then exit cleanly on the EOF.
-	done := make(chan struct{})
-	go func() { ep.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("readLoop did not exit after EOF")
-	}
-}
-
 // TestWritePacketsSkipsReservedPrepend exercises the AsViewList path on a
 // realistic packet shape: reserved header space plus a pushed network header
 // across multiple views. WritePackets must emit exactly the on-wire bytes
@@ -615,7 +559,7 @@ func TestWritePacketsSkipsReservedPrepend(t *testing.T) {
 	defer func() { _ = cli.Close() }()
 	defer func() { _ = srv.Close() }()
 
-	ep := newEndpoint(cli, 1500, false)
+	ep := newEndpoint(cli, 1500)
 	defer ep.Close()
 	ep.Attach(newFakeDispatcher())
 
@@ -654,17 +598,17 @@ func TestWritePacketsSkipsReservedPrepend(t *testing.T) {
 	}
 }
 
-// TestStackDestroyDoesNotDeadlock guards the directDelivery Wait() fix: a
-// caller using the public Stack() accessor to Destroy()/Wait() the stack must
-// not hang. removeNIC detaches us via Attach(nil) and then blocks on
+// TestStackDestroyDoesNotDeadlock guards the Attach(nil) Wait() fix: a caller
+// using the public Stack() accessor to Destroy()/Wait() the stack must not
+// hang. removeNIC detaches us via Attach(nil) and then blocks on
 // LinkEndpoint.Wait(); without closing e.done from Attach(nil) that blocks
-// forever in directDelivery mode (no readLoop closes it).
+// forever (no reader goroutine exists to close it).
 func TestStackDestroyDoesNotDeadlock(t *testing.T) {
 	t.Parallel()
 	cli, srv := net.Pipe()
 	defer func() { _ = srv.Close() }()
 
-	ep := newEndpoint(cli, 1500, true /* directDelivery: no readLoop */)
+	ep := newEndpoint(cli, 1500)
 	s := stack.New(stack.Options{})
 	if err := s.CreateNIC(nicID, ep); err != nil {
 		t.Fatalf("CreateNIC: %s", err)
@@ -742,5 +686,147 @@ func TestSnapStatsEndpointCounters(t *testing.T) {
 		if s[c.idx] != c.want {
 			t.Errorf("snapStats[%d] = %d, want %d", c.idx, s[c.idx], c.want)
 		}
+	}
+}
+
+// halfCloseConn is a net.Conn that supports half-close (like gVisor's *TCPConn),
+// counting forwarded CloseWrite/CloseRead calls.
+type halfCloseConn struct {
+	fakeCloseCounter
+	cw, cr int
+}
+
+func (h *halfCloseConn) CloseWrite() error { h.cw++; return nil }
+func (h *halfCloseConn) CloseRead() error  { h.cr++; return nil }
+
+// TestTrackedConnHalfCloseUnsupported verifies a trackedConn over a conn that
+// lacks half-close (gVisor's *UDPConn) reports errors.ErrUnsupported rather than
+// a misleading nil, while a conn that supports half-close (TCP) forwards.
+func TestTrackedConnHalfCloseUnsupported(t *testing.T) {
+	t.Parallel()
+	n := &Net{}
+
+	plain := n.trackConn(&fakeCloseCounter{}).(*trackedConn)
+	if err := plain.CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseWrite on a non-half-close conn = %v, want ErrUnsupported", err)
+	}
+	if err := plain.CloseRead(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseRead on a non-half-close conn = %v, want ErrUnsupported", err)
+	}
+
+	hc := &halfCloseConn{}
+	tc := n.trackConn(hc).(*trackedConn)
+	if err := tc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite forward: %v", err)
+	}
+	if err := tc.CloseRead(); err != nil {
+		t.Fatalf("CloseRead forward: %v", err)
+	}
+	if hc.cw != 1 || hc.cr != 1 {
+		t.Fatalf("half-close not forwarded: CloseWrite=%d CloseRead=%d, want 1/1", hc.cw, hc.cr)
+	}
+}
+
+// TestTrackedPacketConnWriteToRejectsNonUDPAddr guards against the gonet
+// *UDPConn.WriteTo panic on a non-*net.UDPAddr: trackedPacketConn must reject
+// such an address with an error (not forward it and crash), while a *net.UDPAddr
+// or nil is forwarded normally.
+func TestTrackedPacketConnWriteToRejectsNonUDPAddr(t *testing.T) {
+	t.Parallel()
+	n := &Net{}
+	pc := &fakePacketConn{}
+	conn := n.trackConn(pc).(*trackedPacketConn)
+
+	// A *net.TCPAddr would panic gonet's unchecked assertion — must be rejected.
+	if _, err := conn.WriteTo([]byte("x"), &net.TCPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}); err == nil {
+		t.Fatal("WriteTo(*net.TCPAddr) = nil error, want a rejection")
+	}
+	if pc.writes != 0 {
+		t.Fatalf("a rejected WriteTo was still forwarded (writes=%d)", pc.writes)
+	}
+
+	// *net.UDPAddr is forwarded.
+	if _, err := conn.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}); err != nil {
+		t.Fatalf("WriteTo(*net.UDPAddr): %v", err)
+	}
+	// A nil addr (connected-write case) is forwarded too.
+	if _, err := conn.WriteTo([]byte("x"), nil); err != nil {
+		t.Fatalf("WriteTo(nil): %v", err)
+	}
+	if pc.writes != 2 {
+		t.Fatalf("valid WriteTo not forwarded (writes=%d, want 2)", pc.writes)
+	}
+}
+
+// TestFinalizeDialRejectsAfterClose verifies a dial completing concurrently with
+// Net.Close() is force-closed and reported as net.ErrClosed (not handed back
+// with a nil error, and not left lingering in activeConns).
+func TestFinalizeDialRejectsAfterClose(t *testing.T) {
+	t.Parallel()
+	n := &Net{}
+	n.closeMu.Lock()
+	n.closed = true
+	n.closeMu.Unlock()
+
+	conn := &fakeCloseCounter{}
+	got, err := n.finalizeDial(conn, n.reconnectGen.Load(), "tcp")
+	if got != nil {
+		t.Fatalf("conn = %v, want nil when Net is closed", got)
+	}
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("err = %v, want net.ErrClosed", err)
+	}
+	if conn.closes != 1 {
+		t.Fatalf("underlying conn closed %d times, want 1 (force-close on closed Net)", conn.closes)
+	}
+	count := 0
+	n.activeConns.Range(func(_, _ any) bool { count++; return true })
+	if count != 0 {
+		t.Fatalf("activeConns has %d entries after a rejected dial, want 0", count)
+	}
+}
+
+// deadlineConn records whether SetWriteDeadline was armed and counts Writes.
+type deadlineConn struct {
+	fakeCloseCounter
+	writes     int
+	deadlineMu sync.Mutex
+	armed      bool
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) { c.writes++; return len(p), nil }
+func (c *deadlineConn) SetWriteDeadline(time.Time) error {
+	c.deadlineMu.Lock()
+	c.armed = true
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+// TestWritePacketsArmsWriteDeadline verifies WritePackets bounds its blocking
+// time by arming a write deadline on a conn that supports SetWriteDeadline, so a
+// stalled tunnel write during reconnect cannot block the data path forever.
+func TestWritePacketsArmsWriteDeadline(t *testing.T) {
+	t.Parallel()
+	c := &deadlineConn{}
+	ep := newEndpoint(c, 1500)
+
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData([]byte("hi")),
+	})
+	defer pkt.DecRef()
+	var pbl stack.PacketBufferList
+	pbl.PushBack(pkt)
+
+	if _, err := ep.WritePackets(pbl); err != nil {
+		t.Fatalf("WritePackets: %v", err)
+	}
+	c.deadlineMu.Lock()
+	armed := c.armed
+	c.deadlineMu.Unlock()
+	if !armed {
+		t.Fatal("WritePackets did not arm a write deadline")
+	}
+	if c.writes != 1 {
+		t.Fatalf("writes=%d, want 1", c.writes)
 	}
 }

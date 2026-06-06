@@ -33,11 +33,14 @@ type TunConfig struct {
 // A PacketTunnel that also implements io.Closer is fully torn down by
 // Net.CloseAll.
 type PacketTunnel interface {
-	// TunnelConn returns the IP-packet pipe. One Write == one outbound IP
-	// datagram (netstack → tunnel). Read yields one inbound datagram and is
-	// used only when inbound fast-path delivery is not wired (legacy/testing);
-	// production consumers deliver inbound via SetInbound. If the conn
-	// implements SetReadDeadline it is used for clean shutdown.
+	// TunnelConn returns the outbound IP-packet pipe. One Write == one outbound
+	// IP datagram (netstack → tunnel). The netstack never reads from this conn —
+	// inbound datagrams are delivered via SetInbound — so it is an
+	// outbound-only sink. If the conn implements SetWriteDeadline the netstack
+	// uses it to bound how long a stalled outbound write may block (so a write
+	// wedged during a reconnect can't pin teardown); the bound is approximate
+	// because the deadline is conn-wide and re-armed by concurrent writes. The
+	// conn is Closed when the netstack is Closed.
 	TunnelConn() net.Conn
 
 	// Config returns the current layer-3 assignment.

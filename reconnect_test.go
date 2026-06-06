@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -25,7 +26,7 @@ import (
 func newTestNet(t *testing.T) (*Net, func()) {
 	t.Helper()
 	cli, srv := net.Pipe()
-	ep := newEndpoint(cli, 1500, false)
+	ep := newEndpoint(cli, 1500)
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -432,4 +433,66 @@ func TestDialContextFamilySuffixValidation(t *testing.T) {
 		t.Fatalf("DialContext(udp4, v4 literal): %v", err)
 	}
 	_ = c.Close()
+}
+
+// TestReconnectPreservesTCPListenerOnSameIP verifies the reconnect Abort sweep
+// no longer destroys a consumer-registered TCP listener on a same-IP rekey (the
+// listener's binding is still valid), while an IP-change reconnect — where the
+// old-IP binding really is stale — does abort it.
+func TestReconnectPreservesTCPListenerOnSameIP(t *testing.T) {
+	m := newMock(t, "10.0.0.2")
+	n, err := New(m, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = n.Close() }()
+
+	// Register a TCP listener through the public Stack() accessor (an untracked
+	// endpoint, not minted by DialContext).
+	ln, err := gonet.ListenTCP(n.Stack(), tcpip.FullAddress{NIC: nicID, Port: 8080}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	listeners := func() int {
+		c := 0
+		for _, ep := range n.Stack().RegisteredEndpoints() {
+			if se, ok := ep.(interface{ State() uint32 }); ok &&
+				tcp.EndpointState(se.State()) == tcp.StateListen {
+				c++
+			}
+		}
+		return c
+	}
+	if got := listeners(); got != 1 {
+		t.Fatalf("listening endpoints before reconnect = %d, want 1", got)
+	}
+
+	// Same-IP reconnect must NOT abort the listener.
+	m.reconf(TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.2"),
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+		MTU:     1400,
+	})
+	if got := listeners(); got != 1 {
+		t.Fatalf("same-IP reconnect destroyed the listener: listening endpoints = %d, want 1", got)
+	}
+
+	// IP-change reconnect SHOULD abort the listener (its old-IP binding is now
+	// stale). Abort cleanup may be asynchronous, so poll briefly.
+	m.reconf(TunConfig{
+		LocalIP: netip.MustParseAddr("10.0.0.7"),
+		Netmask: netip.MustParseAddr("255.255.255.0"),
+		Gateway: netip.MustParseAddr("10.0.0.1"),
+		MTU:     1400,
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for listeners() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := listeners(); got != 0 {
+		t.Fatalf("IP-change reconnect did not abort the listener: listening endpoints = %d, want 0", got)
+	}
 }
