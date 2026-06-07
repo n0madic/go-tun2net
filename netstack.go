@@ -18,6 +18,9 @@
 //
 //	httpClient := &http.Client{Transport: &http.Transport{DialContext: ns.DialContext}}
 //	resp, err := httpClient.Get("http://10.8.0.1:8080/")
+//
+//	// Server side: an in-stack TCP listener, also free of gVisor types.
+//	ln, err := ns.ListenTCP(netip.MustParseAddrPort("10.8.0.2:80"))
 package tun2net
 
 import (
@@ -1670,6 +1673,55 @@ func (n *Net) finalizeDial(dialed net.Conn, preGen uint64, network string) (net.
 		return nil, &net.OpError{Op: "dial", Net: network, Err: ErrTunnelIPChanged}
 	}
 	return tracked, nil
+}
+
+// ListenTCP opens a TCP listener inside the netstack on addr. The address
+// family (IPv4 vs IPv6) is derived from addr.Addr(); an unspecified address
+// (0.0.0.0 / ::) listens on the wildcard for that family, and a zero/invalid
+// addr listens on whichever family the NIC currently has, preferring IPv4. The
+// returned net.Listener is a gonet.TCPListener, so callers never touch gvisor
+// types — use Stack() only for cases this and DialContext don't cover.
+//
+// Unlike DialContext there is no reconnect generation guard: a listener is not
+// a zombie bound to a stale 4-tuple, and the OnReconfigure hook already aborts
+// it only when the tunnel IP actually changes (a same-IP rekey leaves it live).
+func (n *Net) ListenTCP(addr netip.AddrPort) (net.Listener, error) {
+	ip := addr.Addr().Unmap()
+
+	var proto tcpip.NetworkProtocolNumber
+	var bindAddr tcpip.Address // zero value == wildcard for the chosen family
+
+	switch {
+	case ip.IsValid() && !ip.IsUnspecified():
+		// Concrete address: bind it on its own family.
+		if ip.Is4() {
+			proto = ipv4.ProtocolNumber
+		} else {
+			proto = ipv6.ProtocolNumber
+		}
+		bindAddr = netipToTCPIPAddr(ip)
+	case ip.Is4(): // 0.0.0.0 → IPv4 wildcard
+		proto = ipv4.ProtocolNumber
+	case ip.Is6(): // :: → IPv6 wildcard
+		proto = ipv6.ProtocolNumber
+	default:
+		// Zero/invalid AddrPort → wildcard on whichever family the NIC has.
+		switch {
+		case n.HasIPv4():
+			proto = ipv4.ProtocolNumber
+		case n.HasIPv6():
+			proto = ipv6.ProtocolNumber
+		default:
+			return nil, fmt.Errorf("netstack: ListenTCP on %v: stack has no IPv4 or IPv6 address", addr)
+		}
+	}
+
+	full := tcpip.FullAddress{NIC: nicID, Addr: bindAddr, Port: addr.Port()}
+	ln, err := gonet.ListenTCP(n.stack, full, proto)
+	if err != nil {
+		return nil, fmt.Errorf("netstack: ListenTCP on %v: %w", addr, err)
+	}
+	return ln, nil
 }
 
 // currentLocalFullAddress returns a FullAddress suitable as `laddr` for a

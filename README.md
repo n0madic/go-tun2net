@@ -23,12 +23,19 @@ defer ns.Close()
 // ns.DialContext matches mihomo's C.Dialer signature byte-for-byte, so it
 // drops straight into a mihomo outbound or any http.Transport.
 httpClient := &http.Client{Transport: &http.Transport{DialContext: ns.DialContext}}
+
+// Server side: an in-stack TCP listener, also free of gVisor types — it
+// returns a plain net.Listener.
+ln, err := ns.ListenTCP(netip.MustParseAddrPort("10.9.0.2:80"))
+if err != nil { ... }
+conn, err := ln.Accept()
 ```
 
 ## Features
 
 - Single-NIC gVisor stack (IPv4 + IPv6), TCP/UDP/ICMP.
 - `DialContext(ctx, network, addr)` (literal-IP; no DNS) — mihomo `C.Dialer`-compatible.
+- `ListenTCP(addr)` — in-stack TCP listener returning a `net.Listener`, no gVisor types.
 - Live reconfiguration: `OnReconfigure` re-applies addresses/routes and force-
   closes stale conns on tunnel IP change (reconnect/rekey), matching kernel
   `RTM_CHANGE` semantics.
