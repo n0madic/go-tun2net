@@ -412,6 +412,7 @@ func TestClampInnerMTU(t *testing.T) {
 		{"server pushes 0 (no MTU pushed): default to safe", 0, safeInnerMTU},
 	}
 	for _, tc := range cases {
+		tc := tc // capture range var (pre-go1.22 loopvar semantics)
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			if got := clampInnerMTU(tc.pushed); got != tc.want {
@@ -649,7 +650,7 @@ func TestNetStatsSub(t *testing.T) {
 // logged), and confirms the one gauge stays a gauge.
 func TestStatsMetricDefsComplete(t *testing.T) {
 	t.Parallel()
-	for i := range numMetrics {
+	for i := 0; i < numMetrics; i++ {
 		m := metricDefs[i]
 		if m.deltaKey == "" && m.totalKey == "" && m.gaugeKey == "" {
 			t.Errorf("metric index %d has no log key — forgotten metricDefs entry", i)

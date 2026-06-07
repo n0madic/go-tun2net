@@ -28,7 +28,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -47,6 +46,7 @@ import (
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/icmp"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
+	"golang.org/x/exp/slog"
 )
 
 // nicID is the only NIC we register inside the stack.
@@ -1495,7 +1495,7 @@ func (n *Net) statsLoggerLoop() {
 			// per-window delta, totalKey → running total, gaugeKey → current
 			// value (no delta).
 			args := make([]any, 0, statsArgCap)
-			for i := range numMetrics {
+			for i := 0; i < numMetrics; i++ {
 				m := metricDefs[i]
 				if m.deltaKey != "" {
 					args = append(args, m.deltaKey, d[i])

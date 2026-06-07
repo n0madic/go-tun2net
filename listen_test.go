@@ -231,6 +231,7 @@ func TestListenTCPEndToEnd(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		tc := tc // capture range var (pre-go1.22 loopvar semantics)
 		t.Run(tc.name, func(t *testing.T) {
 			clientNet, serverNet := newWiredPair(t, tc.clientCfg, tc.serverCfg)
 

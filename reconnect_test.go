@@ -124,7 +124,7 @@ func TestPostReconnectDialUsesNewIP(t *testing.T) {
 		t.Fatalf("applyConfig(pr1): %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	c1, err := n.DialContext(ctx, "udp", "10.0.0.1:53")
@@ -231,7 +231,7 @@ func TestDialContextIPv6UsesNICAddress(t *testing.T) {
 		t.Fatalf("applyConfig: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// UDP because gonet.DialUDP is non-blocking — we don't need a server to
@@ -341,7 +341,7 @@ func TestDialContextUnmapsV4MappedV6(t *testing.T) {
 		t.Fatalf("applyConfig: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// UDP because gonet.DialUDP is non-blocking — a successful bind is all we
@@ -401,7 +401,7 @@ func TestDialContextFamilySuffixValidation(t *testing.T) {
 		t.Fatalf("applyConfig: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	mismatches := []struct {
@@ -414,6 +414,7 @@ func TestDialContextFamilySuffixValidation(t *testing.T) {
 		{"udp6", "10.0.0.1:53"},
 	}
 	for _, tc := range mismatches {
+		tc := tc // capture range var (pre-go1.22 loopvar semantics)
 		t.Run(tc.network+"_mismatch", func(t *testing.T) {
 			c, err := n.DialContext(ctx, tc.network, tc.addr)
 			if err == nil {
